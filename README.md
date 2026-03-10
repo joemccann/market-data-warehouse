@@ -6,7 +6,7 @@ A local-first financial data warehouse for universe-scale market data.
 
 The project is designed to store and analyze historical **OHLCV data across equities, options, and futures** with a path from **daily bars today to intraday data later**. It uses a **partitioned Parquet data lake** as the canonical storage layer, **DuckDB** as the fast local analytical engine for research and backtesting, and **ClickHouse** as the production-oriented warehouse for large-scale aggregation, serving, and concurrency.
 
-Today, the implemented ingestion path is still Python-first and daily-equity-focused: Interactive Brokers data lands in DuckDB first, then the current scripts publish per-ticker bronze snapshots under `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`. The broader staged-Parquet and multi-asset orchestration remains the target architecture, but it is not the current runtime path yet.
+Today, the implemented ingestion path is Python-first and daily-equity-focused: Interactive Brokers data lands directly in per-ticker bronze snapshots under `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`, and DuckDB is rebuilt from parquet when you want a local analytical file. The broader staged-Parquet and multi-asset orchestration remains the target architecture, but the live service path no longer writes `market.duckdb`. For scheduled daily syncs, IB remains the primary source and the service now has a narrow external fallback chain for unresolved target-day gaps in the current U.S. equity universe.
 
 The goal is to give you:
 
@@ -42,6 +42,7 @@ In one sentence:
 - `duckdb` — local analytical engine
 - `ib_insync` — async IB API client
 - `polars`, `pandas`, `pyarrow` — data manipulation and Parquet I/O
+- `requests` — public fallback quote lookups during daily sync recovery
 - `rich` — terminal UI (progress bars, logging)
 - `pytest`, `pytest-cov`, `responses` — testing
 
@@ -144,13 +145,13 @@ python scripts/fetch_ib_historical.py --preset presets/sp500.json
 # Custom years, port, concurrency:
 python scripts/fetch_ib_historical.py --years 10 --port 7497 --max-concurrent 4
 
-# Backfill missing older data for tickers already in DB:
+# Backfill missing older data for tickers already in bronze parquet:
 python scripts/fetch_ib_historical.py --preset presets/sp500.json --backfill
 ```
 
 Current behavior:
-- Normal mode still does `delete -> insert` per ticker in DuckDB
-- After each successful ticker write, the script rewrites that ticker's bronze snapshot at `~/market-warehouse/data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`
+- Normal mode atomically rewrites the canonical per-ticker bronze snapshot
+- The writer uses `temp -> validate -> os.replace()` for crash-safe publication
 - If IB returns an empty head timestamp for a symbol, the fetcher falls back to the earliest supported IB historical date instead of skipping the symbol entirely
 
 ### Backfill Mode
@@ -162,11 +163,11 @@ python scripts/fetch_ib_historical.py --preset presets/sp500.json --backfill
 ```
 
 Backfill mode:
-- Detects each ticker's oldest existing date in DuckDB
+- Detects each ticker's oldest existing date in bronze parquet
 - Fetches only the gap from IB inception to that oldest date
-- Inserts without deleting existing data (dedup via DB constraint)
+- Merges older bars into the existing per-ticker snapshot without deleting newer data
 - Uses a separate cursor JSON file (`cursor_backfill_{name}.json`) for independent tracking
-- Skips tickers not yet in DB (use normal fetch for those first)
+- Skips tickers not yet in bronze parquet (use normal fetch for those first)
 
 ### Auto-Restarting Runner
 
@@ -183,18 +184,18 @@ This script:
 3. Monitors cursor file progress; restarts with cooldown if stalled
 4. Gives up after 3 consecutive failures with no new completions
 
-This populates:
-- **DuckDB** `md.symbols` + `md.equities_daily`
+This publishes:
 - **Bronze Parquet** → `~/market-warehouse/data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`
+- **DuckDB** remains an optional rebuild target from bronze parquet
 
 ### Daily Updates
 
-`daily_update.py` is a lightweight script for daily scheduled runs (~2,500 tickers). It discovers tickers from DB, detects gaps vs the latest trading day, fetches only missing bars, validates OHLCV integrity, and inserts (no delete). Idempotent and safe for concurrent runs.
+`daily_update.py` is a lightweight script for daily scheduled runs (~2,500 tickers). It discovers tickers from bronze parquet, detects gaps vs the latest trading day, fetches only missing bars, validates OHLCV integrity, and atomically rewrites only the affected per-ticker snapshots. If IB still cannot supply the target trading day for a symbol, the script can recover that missing day from a narrow public fallback chain before publishing parquet.
 
 ```bash
 source ~/market-warehouse/.venv/bin/activate
 
-# Normal daily run (all tickers in DB):
+# Normal daily run (all tickers in bronze parquet):
 python scripts/daily_update.py
 
 # Dry-run — report gaps without fetching:
@@ -211,12 +212,31 @@ python scripts/daily_update.py --port 7497 --max-concurrent 4 --batch-size 25
 ```
 
 **Key design:**
-- Discovers tickers from DB via `DBClient.get_latest_dates()` — no hardcoded lists
-- Insert-only (dedup via unique constraint) — no delete, no data loss risk
+- Discovers tickers from bronze parquet via `BronzeClient.get_latest_dates()` — no hardcoded lists
+- Parquet-first live writes avoid DuckDB file-lock contention during service runs
 - Bar validation: checks OHLCV relationships, positive prices, valid trading days, duplicate dates
-- Rewrites a per-ticker bronze snapshot after each successful insert
+- Uses atomic per-ticker snapshot publication after each successful merge
+- Fallback chain for unresolved target-day gaps: Nasdaq historical quote API (`assetclass=stocks`, then `assetclass=etf`) and finally Stooq U.S. daily CSV (`symbol.us`)
+- Fallback bars go through the same validation and `BronzeClient.merge_ticker_rows(...)` path as IB bars
+- Run summary exposes `Fallback attempts`, `Fallback successes`, and `Fallback symbols`
 - Pure-Python NYSE trading calendar (no new dependencies)
 - Logs to `~/market-warehouse/logs/daily_update_YYYY-MM-DD.log`
+
+Fallback scope and limits:
+- Scoped to the repo's current live universe: U.S. equities and ETFs on the NYSE trading calendar
+- Recovery mechanism only; IB remains the system-preferred source
+- If IB is broadly down and many symbols need fallback at once, public endpoints may rate-limit or show small volume differences versus IB
+
+### Rebuild DuckDB From Bronze
+
+When you want a fresh queryable DuckDB file without making the service hold a write lock:
+
+```bash
+source ~/market-warehouse/.venv/bin/activate
+python scripts/rebuild_duckdb_from_parquet.py
+```
+
+This rebuilds `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree using set-based `INSERT INTO ... SELECT FROM read_parquet(...)`.
 
 ### Scheduling with launchd (macOS)
 
@@ -243,6 +263,9 @@ python -m pytest tests/ -v --cov=clients --cov=scripts --cov-report=term-missing
 
 # Run only unit tests (skip DB integration tests)
 python -m pytest tests/ -v -m "not integration"
+
+# Keep coroutine leaks from mocked async runners from slipping back in
+python -m pytest tests/ -v -W error::RuntimeWarning
 ```
 
 ### Adding new code
@@ -254,6 +277,8 @@ When adding new modules or scripts:
 3. Mock external I/O (HTTP, file system) in unit tests
 4. Use the `tmp_duckdb` fixture for DB integration tests
 5. Run coverage and verify 100% for the configured coverage set before committing
+6. Run `-W error::RuntimeWarning` at least once before committing when a script test mocks async runners like `ib.ib.run(...)`
+7. `pyproject.toml` enforces `fail_under = 100`; `if __name__ == "__main__"` blocks are excluded
 
 Test dependencies: `pytest`, `pytest-cov`, `responses`
 

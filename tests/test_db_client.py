@@ -6,6 +6,7 @@ No production data is touched.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -422,3 +423,102 @@ class TestWriteTickerParquet:
         deep_dir = tmp_path / "a" / "b" / "bronze"
         result = db.write_ticker_parquet("TEST", sid, deep_dir)
         assert result.exists()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# storage compatibility helpers
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestStorageCompatibility:
+    @pytest.mark.integration
+    def test_get_oldest_dates(self, db):
+        sid = db.upsert_symbol("AAPL", "equity", "SMART")
+        db.insert_equities_daily(
+            [
+                {
+                    "trade_date": "2020-01-02",
+                    "symbol_id": sid,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                },
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": sid,
+                    "open": 200.0, "high": 205.0, "low": 199.0,
+                    "close": 203.0, "adj_close": 203.0, "volume": 2000000,
+                },
+            ]
+        )
+
+        assert db.get_oldest_dates() == {"AAPL": "2020-01-02"}
+
+    @pytest.mark.integration
+    def test_get_existing_symbols_and_get_symbol_id(self, db):
+        sid = db.get_symbol_id("AAPL")
+        db.insert_equities_daily(
+            [
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": sid,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                }
+            ]
+        )
+
+        assert db.get_symbol_id("AAPL") == sid
+        assert db.get_existing_symbols() == {"AAPL"}
+
+    @pytest.mark.integration
+    def test_replace_and_merge_ticker_rows(self, db):
+        first = [
+            {
+                "trade_date": "2025-01-02",
+                "symbol_id": 999,
+                "open": 150.0, "high": 155.0, "low": 149.0,
+                "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+            }
+        ]
+        second = [
+            {
+                "trade_date": "2025-01-03",
+                "symbol_id": 111,
+                "open": 153.0, "high": 157.0, "low": 152.0,
+                "close": 156.0, "adj_close": 156.0, "volume": 1200000,
+            }
+        ]
+
+        assert db.replace_ticker_rows("AAPL", first) == 1
+        assert db.merge_ticker_rows("AAPL", second) == 1
+        assert db.get_summary() == [
+            {
+                "symbol": "AAPL",
+                "rows": 2,
+                "earliest": date(2025, 1, 2),
+                "latest": date(2025, 1, 3),
+            }
+        ]
+
+    @pytest.mark.integration
+    def test_replace_equities_from_parquet_rolls_back_on_error(self, db, tmp_path):
+        sid = db.upsert_symbol("AAPL", "equity", "SMART")
+        db.insert_equities_daily(
+            [
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": sid,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                }
+            ]
+        )
+
+        broken_bronze = tmp_path / "bronze" / "symbol=AAPL"
+        broken_bronze.mkdir(parents=True, exist_ok=True)
+        (broken_bronze / "data.parquet").write_text("not parquet")
+
+        with pytest.raises(Exception):
+            db.replace_equities_from_parquet(tmp_path / "bronze")
+
+        assert db.get_latest_dates() == {"AAPL": "2025-01-02"}

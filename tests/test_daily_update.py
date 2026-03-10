@@ -13,13 +13,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from clients.bronze_client import BronzeClient
 from scripts.daily_update import (
     _easter,
+    _fallback_client,
     bars_to_rows,
     classify_gaps,
     compute_ib_duration,
+    fetch_fallback_bars,
     fetch_batch,
     fetch_ticker_update,
+    get_missing_trading_dates,
     get_nyse_holidays,
     is_trading_day,
     load_preset,
@@ -42,6 +46,12 @@ def _make_bar(
     return SimpleNamespace(
         date=date, open=open, high=high, low=low, close=close, volume=volume
     )
+
+
+def _seed_bronze(bronze_dir, symbol, rows):
+    """Write a canonical bronze snapshot for *symbol*."""
+    with BronzeClient(bronze_dir=bronze_dir) as bronze:
+        bronze.replace_ticker_rows(symbol, rows)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -381,6 +391,52 @@ class TestBarsToRows:
         assert bars_to_rows([], symbol_id=1) == []
 
 
+class TestGetMissingTradingDates:
+    def test_returns_missing_target_date(self):
+        latest = date(2025, 1, 2)
+        target = date(2025, 1, 3)
+        assert get_missing_trading_dates(latest, target, []) == [date(2025, 1, 3)]
+
+    def test_skips_dates_already_present(self):
+        latest = date(2025, 1, 2)
+        target = date(2025, 1, 6)
+        bars = [_make_bar(date="2025-01-03"), _make_bar(date="2025-01-06")]
+        assert get_missing_trading_dates(latest, target, bars) == []
+
+
+class TestFetchFallbackBars:
+    def test_fetches_only_available_dates(self):
+        fallback = _mock_fallback_instance(
+            {
+                "2025-01-03": SimpleNamespace(
+                    date="2025-01-03",
+                    open=154.0,
+                    high=158.0,
+                    low=152.0,
+                    close=156.0,
+                    volume=1000000,
+                    source="nasdaq:stocks",
+                )
+            }
+        )
+
+        bars, sources = fetch_fallback_bars(
+            "AAPL",
+            [date(2025, 1, 3), date(2025, 1, 6)],
+            fallback,
+        )
+        assert len(bars) == 1
+        assert bars[0].date == "2025-01-03"
+        assert sources == ["nasdaq:stocks"]
+
+
+class TestFallbackClientSelection:
+    def test_uses_patched_daily_bar_fallback_client(self, monkeypatch):
+        sentinel = _mock_fallback_instance()
+        monkeypatch.setattr("scripts.daily_update.DailyBarFallbackClient", lambda: sentinel)
+        assert _fallback_client() is sentinel
+
+
 # ══════════════════════════════════════════════════════════════════════
 # load_preset
 # ══════════════════════════════════════════════════════════════════════
@@ -461,23 +517,39 @@ class TestFetchBatch:
 
 def _mock_ib_instance(ticker_bars):
     """Create a mock IBClient context manager returning *ticker_bars*."""
+    def _run(awaitable):
+        awaitable.close()
+        return ticker_bars
+
     mock = MagicMock()
     mock.__enter__ = MagicMock(return_value=mock)
     mock.__exit__ = MagicMock(return_value=False)
-    mock.ib.run.return_value = ticker_bars
+    mock.ib.run.side_effect = _run
+    return mock
+
+
+def _mock_fallback_instance(date_to_bar=None):
+    """Create a mock fallback client context manager."""
+    date_to_bar = date_to_bar or {}
+    mock = MagicMock()
+    mock.__enter__ = MagicMock(return_value=mock)
+    mock.__exit__ = MagicMock(return_value=False)
+    mock.get_daily_bar.side_effect = lambda ticker, trade_date: date_to_bar.get(
+        trade_date.isoformat()
+    )
     return mock
 
 
 class TestMain:
     @pytest.mark.integration
-    def test_not_trading_day_exits(self, tmp_duckdb, monkeypatch, capsys):
+    def test_not_trading_day_exits(self, monkeypatch, capsys):
         """main() exits early on non-trading day without --force."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
         with patch("scripts.daily_update.is_trading_day", return_value=False):
             main()
 
     @pytest.mark.integration
-    def test_force_on_non_trading_day(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_force_on_non_trading_day(self, tmp_path, monkeypatch):
         """main() runs with --force on non-trading day."""
         monkeypatch.setattr("sys.argv", ["daily_update.py", "--force"])
 
@@ -485,32 +557,31 @@ class TestMain:
             patch("scripts.daily_update.is_trading_day", return_value=False),
             patch("scripts.daily_update.previous_trading_day", return_value=date(2025, 1, 3)),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
+            patch("scripts.daily_update.BRONZE_DIR", tmp_path / "bronze"),
         ):
-            main()  # No data in DB → early return
+            main()  # No bronze data → early return
 
     @pytest.mark.integration
-    def test_no_tickers_in_db(self, tmp_duckdb, monkeypatch):
-        """main() exits when no tickers in DB."""
+    def test_no_tickers_in_bronze(self, monkeypatch):
+        """main() exits when no tickers are available in bronze."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
-            patch("scripts.daily_update.DBClient") as MockDB,
+            patch("scripts.daily_update.BronzeClient") as MockBronze,
         ):
-            mock_db = MagicMock()
-            mock_db.__enter__ = MagicMock(return_value=mock_db)
-            mock_db.__exit__ = MagicMock(return_value=False)
-            mock_db.get_latest_dates.return_value = {}
-            MockDB.return_value = mock_db
+            mock_bronze = MagicMock()
+            mock_bronze.__enter__ = MagicMock(return_value=mock_bronze)
+            mock_bronze.__exit__ = MagicMock(return_value=False)
+            mock_bronze.get_latest_dates.return_value = {}
+            MockBronze.return_value = mock_bronze
             main()
 
     @pytest.mark.integration
-    def test_all_up_to_date(self, tmp_duckdb, monkeypatch):
+    def test_all_up_to_date(self, monkeypatch):
         """main() exits when all tickers are up to date."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
 
@@ -518,21 +589,21 @@ class TestMain:
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
-            patch("scripts.daily_update.DBClient") as MockDB,
+            patch("scripts.daily_update.BronzeClient") as MockBronze,
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
             mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
 
-            mock_db = MagicMock()
-            mock_db.__enter__ = MagicMock(return_value=mock_db)
-            mock_db.__exit__ = MagicMock(return_value=False)
-            mock_db.get_latest_dates.return_value = {"AAPL": "2025-01-03"}
-            MockDB.return_value = mock_db
+            mock_bronze = MagicMock()
+            mock_bronze.__enter__ = MagicMock(return_value=mock_bronze)
+            mock_bronze.__exit__ = MagicMock(return_value=False)
+            mock_bronze.get_latest_dates.return_value = {"AAPL": "2025-01-03"}
+            MockBronze.return_value = mock_bronze
             main()
 
     @pytest.mark.integration
-    def test_dry_run(self, tmp_duckdb, monkeypatch):
+    def test_dry_run(self, monkeypatch):
         """main() with --dry-run prints gap report without fetching."""
         monkeypatch.setattr("sys.argv", ["daily_update.py", "--dry-run"])
 
@@ -540,59 +611,54 @@ class TestMain:
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
-            patch("scripts.daily_update.DBClient") as MockDB,
+            patch("scripts.daily_update.BronzeClient") as MockBronze,
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
             mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
 
-            mock_db = MagicMock()
-            mock_db.__enter__ = MagicMock(return_value=mock_db)
-            mock_db.__exit__ = MagicMock(return_value=False)
-            mock_db.get_latest_dates.return_value = {"AAPL": "2025-01-02"}
-            MockDB.return_value = mock_db
+            mock_bronze = MagicMock()
+            mock_bronze.__enter__ = MagicMock(return_value=mock_bronze)
+            mock_bronze.__exit__ = MagicMock(return_value=False)
+            mock_bronze.get_latest_dates.return_value = {"AAPL": "2025-01-02"}
+            MockBronze.return_value = mock_bronze
             main()
 
         # Should not have called IB
         # (We never create IBClient mock, so if it was called it would fail)
 
     @pytest.mark.integration
-    def test_end_to_end(self, tmp_duckdb, tmp_path, monkeypatch):
-        """Full integration: main() fetches, validates, inserts bars."""
+    def test_end_to_end(self, tmp_path, monkeypatch):
+        """Full integration: main() fetches, validates, and publishes bars."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
-
-        from clients.db_client import DBClient as RealDBClient
-
-        # Pre-seed AAPL with data through 2025-01-02
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         today = date(2025, 1, 3)
         mock_ib = _mock_ib_instance(
             {"AAPL": [_make_bar(date="2025-01-03", open=154.0, high=158.0, low=152.0, close=156.0)]}
         )
-        bronze_dir = tmp_path / "bronze"
+        mock_fallback = _mock_fallback_instance()
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
             patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
@@ -601,148 +667,372 @@ class TestMain:
             mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
             main()
 
-        # Verify new bar was inserted
-        check_db = RealDBClient(db_path=tmp_duckdb)
-        result = check_db.query(
-            "SELECT count(*) AS cnt FROM md.equities_daily WHERE symbol_id = ?",
-            [sid],
-        )
-        assert result[0]["cnt"] == 2
-        check_db.close()
-
-        # Verify per-ticker Parquet was written
-        assert (bronze_dir / "symbol=AAPL" / "data.parquet").exists()
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 2
+        assert [row["trade_date"] for row in rows] == ["2025-01-02", "2025-01-03"]
 
     @pytest.mark.integration
-    def test_no_new_bars_after_latest(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_no_new_bars_after_latest(self, tmp_path, monkeypatch):
         """main() handles case where all fetched bars are older than latest_date."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
-
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         today = date(2025, 1, 3)
         # IB returns a bar on the same date as latest — should be filtered out
         mock_ib = _mock_ib_instance(
             {"AAPL": [_make_bar(date="2025-01-02", close=153.0)]}
         )
+        mock_fallback = _mock_fallback_instance()
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.daily_update.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
             mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
             main()
 
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 1
+        assert rows[0]["trade_date"] == "2025-01-02"
+
     @pytest.mark.integration
-    def test_empty_bars_from_ib(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_empty_bars_from_ib(self, tmp_path, monkeypatch):
         """main() handles tickers with no bars returned from IB."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
-
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         today = date(2025, 1, 3)
         mock_ib = _mock_ib_instance({"AAPL": []})
+        mock_fallback = _mock_fallback_instance()
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.daily_update.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
             mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
             main()
 
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 1
+        assert rows[0]["trade_date"] == "2025-01-02"
+
     @pytest.mark.integration
-    def test_all_bars_fail_validation(self, tmp_duckdb, tmp_path, monkeypatch):
-        """main() handles tickers where all bars fail validation."""
+    def test_fallback_recovers_missing_bar(self, tmp_path, monkeypatch):
+        """main() publishes a validated fallback bar when IB has no data."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
-
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
+
+        today = date(2025, 1, 3)
+        mock_ib = _mock_ib_instance({"AAPL": []})
+        mock_fallback = _mock_fallback_instance(
+            {
+                "2025-01-03": SimpleNamespace(
+                    date="2025-01-03",
+                    open=154.0,
+                    high=158.0,
+                    low=152.0,
+                    close=156.0,
+                    volume=1500000,
+                    source="nasdaq:stocks",
+                )
+            }
+        )
+
+        with (
+            patch("scripts.daily_update.is_trading_day", return_value=True),
+            patch("scripts.daily_update.date") as mock_date,
+            patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
+            patch(
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
+            ),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
+        ):
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            main()
+
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 2
+        assert rows[-1]["trade_date"] == "2025-01-03"
+        assert rows[-1]["close"] == 156.0
+
+    @pytest.mark.integration
+    def test_all_bars_fail_validation(self, tmp_path, monkeypatch):
+        """main() handles tickers where all bars fail validation."""
+        monkeypatch.setattr("sys.argv", ["daily_update.py"])
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
+            [
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": 1,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                }
+            ]
+        )
 
         today = date(2025, 1, 3)
         # Bad bar: high < low
         bad_bar = _make_bar(date="2025-01-03", high=1.0, low=200.0)
         mock_ib = _mock_ib_instance({"AAPL": [bad_bar]})
+        mock_fallback = _mock_fallback_instance()
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.daily_update.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
             mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
             main()
 
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 1
+        assert rows[0]["trade_date"] == "2025-01-02"
+
     @pytest.mark.integration
-    def test_preset_filter(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_fallback_recovers_missing_target_bar(self, tmp_path, monkeypatch):
+        """Fallback publishes the target date when IB returns no bars."""
+        monkeypatch.setattr("sys.argv", ["daily_update.py"])
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
+            [
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": 1,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                }
+            ]
+        )
+
+        today = date(2025, 1, 3)
+        mock_ib = _mock_ib_instance({"AAPL": []})
+        mock_fallback = _mock_fallback_instance(
+            {
+                "2025-01-03": SimpleNamespace(
+                    date="2025-01-03",
+                    open=154.0,
+                    high=158.0,
+                    low=152.0,
+                    close=156.0,
+                    volume=1000000,
+                    source="nasdaq:stocks",
+                )
+            }
+        )
+
+        with (
+            patch("scripts.daily_update.is_trading_day", return_value=True),
+            patch("scripts.daily_update.date") as mock_date,
+            patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
+            patch(
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
+            ),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
+        ):
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            main()
+
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert [row["trade_date"] for row in rows] == ["2025-01-02", "2025-01-03"]
+
+    @pytest.mark.integration
+    def test_fallback_fills_only_missing_dates_after_partial_ib_recovery(self, tmp_path, monkeypatch):
+        """Fallback complements IB when a multi-day gap is only partially recovered."""
+        monkeypatch.setattr("sys.argv", ["daily_update.py"])
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
+            [
+                {
+                    "trade_date": "2025-01-01",
+                    "symbol_id": 1,
+                    "open": 149.0, "high": 151.0, "low": 148.0,
+                    "close": 150.0, "adj_close": 150.0, "volume": 1000000,
+                }
+            ]
+        )
+
+        today = date(2025, 1, 3)
+        mock_ib = _mock_ib_instance({"AAPL": [_make_bar(date="2025-01-02", close=153.0)]})
+        mock_fallback = _mock_fallback_instance(
+            {
+                "2025-01-03": SimpleNamespace(
+                    date="2025-01-03",
+                    open=154.0,
+                    high=158.0,
+                    low=152.0,
+                    close=156.0,
+                    volume=1000000,
+                    source="stooq:us",
+                )
+            }
+        )
+
+        with (
+            patch("scripts.daily_update.is_trading_day", return_value=True),
+            patch("scripts.daily_update.date") as mock_date,
+            patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
+            patch(
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
+            ),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
+        ):
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            main()
+
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert [row["trade_date"] for row in rows] == [
+            "2025-01-01",
+            "2025-01-02",
+            "2025-01-03",
+        ]
+
+    @pytest.mark.integration
+    def test_partial_fallback_leaves_symbol_failed_when_target_still_missing(self, tmp_path, monkeypatch):
+        """main() publishes what it can but fails the ticker if dates still remain unresolved."""
+        monkeypatch.setattr("sys.argv", ["daily_update.py"])
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
+            [
+                {
+                    "trade_date": "2025-01-01",
+                    "symbol_id": 1,
+                    "open": 149.0, "high": 151.0, "low": 148.0,
+                    "close": 150.0, "adj_close": 150.0, "volume": 1000000,
+                }
+            ]
+        )
+
+        today = date(2025, 1, 3)
+        mock_ib = _mock_ib_instance({"AAPL": []})
+        mock_fallback = _mock_fallback_instance(
+            {
+                "2025-01-02": SimpleNamespace(
+                    date="2025-01-02",
+                    open=151.0,
+                    high=152.0,
+                    low=150.0,
+                    close=151.5,
+                    volume=1000000,
+                    source="stooq:us",
+                )
+            }
+        )
+
+        with (
+            patch("scripts.daily_update.is_trading_day", return_value=True),
+            patch("scripts.daily_update.date") as mock_date,
+            patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
+            patch(
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
+            ),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
+        ):
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            main()
+
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert [row["trade_date"] for row in rows] == [
+            "2025-01-01",
+            "2025-01-02",
+        ]
+
+    @pytest.mark.integration
+    def test_preset_filter(self, tmp_path, monkeypatch):
         """main() with --preset filters to only those tickers."""
         preset = {"name": "test", "tickers": ["AAPL"]}
         preset_file = tmp_path / "test.json"
@@ -752,34 +1042,41 @@ class TestMain:
             "sys.argv", ["daily_update.py", "--preset", str(preset_file), "--dry-run"]
         )
 
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid_a = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        sid_m = seed_db.upsert_symbol("MSFT", "equity", "SMART")
-        for sid in [sid_a, sid_m]:
-            seed_db.insert_equities_daily(
-                [
-                    {
-                        "trade_date": "2025-01-02",
-                        "symbol_id": sid,
-                        "open": 150.0, "high": 155.0, "low": 149.0,
-                        "close": 153.0, "adj_close": 153.0, "volume": 1000000,
-                    }
-                ]
-            )
-        seed_db.close()
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
+            [
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": 1,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                }
+            ],
+        )
+        _seed_bronze(
+            bronze_dir,
+            "MSFT",
+            [
+                {
+                    "trade_date": "2025-01-02",
+                    "symbol_id": 2,
+                    "open": 150.0, "high": 155.0, "low": 149.0,
+                    "close": 153.0, "adj_close": 153.0, "volume": 1000000,
+                }
+            ],
+        )
 
         today = date(2025, 1, 3)
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
@@ -787,8 +1084,8 @@ class TestMain:
             main()  # Should only report AAPL, not MSFT
 
     @pytest.mark.integration
-    def test_preset_no_matching_tickers(self, tmp_duckdb, tmp_path, monkeypatch):
-        """main() with --preset exits when no preset tickers in DB."""
+    def test_preset_no_matching_tickers(self, tmp_path, monkeypatch):
+        """main() with --preset exits when no preset tickers are in bronze."""
         preset = {"name": "test", "tickers": ["NOPE"]}
         preset_file = tmp_path / "test.json"
         preset_file.write_text(json.dumps(preset))
@@ -797,32 +1094,29 @@ class TestMain:
             "sys.argv", ["daily_update.py", "--preset", str(preset_file)]
         )
 
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         today = date(2025, 1, 3)
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
@@ -830,28 +1124,26 @@ class TestMain:
             main()
 
     @pytest.mark.integration
-    def test_batching(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_batching(self, tmp_path, monkeypatch):
         """main() splits tickers into batches."""
         monkeypatch.setattr(
             "sys.argv", ["daily_update.py", "--batch-size", "1"]
         )
 
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        for sym in ["AAPL", "MSFT"]:
-            sid = seed_db.upsert_symbol(sym, "equity", "SMART")
-            seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        for idx, sym in enumerate(["AAPL", "MSFT"], start=1):
+            _seed_bronze(
+                bronze_dir,
+                sym,
                 [
                     {
                         "trade_date": "2025-01-02",
-                        "symbol_id": sid,
+                        "symbol_id": idx,
                         "open": 150.0, "high": 155.0, "low": 149.0,
                         "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                     }
-                ]
+                ],
             )
-        seed_db.close()
 
         today = date(2025, 1, 3)
         mock_ib = _mock_ib_instance(
@@ -860,18 +1152,18 @@ class TestMain:
                 "MSFT": [_make_bar(date="2025-01-03")],
             }
         )
+        mock_fallback = _mock_fallback_instance()
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.daily_update.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat
@@ -882,43 +1174,40 @@ class TestMain:
         assert mock_ib.ib.run.call_count == 2
 
     @pytest.mark.integration
-    def test_validation_issues_printed(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_validation_issues_printed(self, tmp_path, monkeypatch):
         """main() prints validation issues in the summary."""
         monkeypatch.setattr("sys.argv", ["daily_update.py"])
-
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         today = date(2025, 1, 3)
         # Mix of good and bad bars
         good_bar = _make_bar(date="2025-01-03", open=154.0, high=158.0, low=152.0, close=156.0)
         bad_bar = _make_bar(date="2025-01-06", high=1.0, low=999.0)  # bad OHLC
         mock_ib = _mock_ib_instance({"AAPL": [good_bar, bad_bar]})
+        mock_fallback = _mock_fallback_instance()
 
         with (
             patch("scripts.daily_update.is_trading_day", return_value=True),
             patch("scripts.daily_update.date") as mock_date,
             patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
             patch(
-                "scripts.daily_update.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.daily_update.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.daily_update.BRONZE_DIR", bronze_dir),
         ):
             mock_date.today.return_value = today
             mock_date.fromisoformat = date.fromisoformat

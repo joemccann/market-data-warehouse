@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 import duckdb
 
+from clients.symbol_ids import stable_symbol_id
+
 log = logging.getLogger(__name__)
 
 _DEFAULT_DB_PATH = Path.home() / "market-warehouse" / "duckdb" / "market.duckdb"
@@ -33,15 +35,36 @@ class DBClient:
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
-        """Create unique index for dedup if it doesn't exist."""
-        try:
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_equities_daily_dedup "
-                "ON md.equities_daily (trade_date, symbol_id)"
+        """Create the md schema, tables, and dedup index if they don't exist."""
+        self._conn.execute("CREATE SCHEMA IF NOT EXISTS md")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS md.symbols (
+                symbol_id BIGINT PRIMARY KEY,
+                symbol VARCHAR,
+                asset_class VARCHAR,
+                venue VARCHAR
             )
-        except duckdb.CatalogException:
-            # Index already exists or table structure issue — safe to continue
-            pass
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS md.equities_daily (
+                trade_date DATE,
+                symbol_id BIGINT,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                adj_close DOUBLE,
+                volume BIGINT
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_equities_daily_dedup "
+            "ON md.equities_daily (trade_date, symbol_id)"
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -67,8 +90,7 @@ class DBClient:
         if result:
             return result[0]
 
-        # Generate deterministic ID from symbol hash
-        symbol_id = abs(hash(symbol)) % (2**53)
+        symbol_id = stable_symbol_id(symbol)
 
         self._conn.execute(
             "INSERT INTO md.symbols (symbol_id, symbol, asset_class, venue) VALUES (?, ?, ?, ?)",
@@ -148,6 +170,56 @@ class DBClient:
         )
         return {r["symbol"]: str(r["latest"]) for r in rows}
 
+    def get_oldest_dates(self) -> dict[str, str]:
+        """Return {symbol: oldest_trade_date_str} for each ticker with data."""
+        rows = self.query(
+            """
+            SELECT s.symbol, MIN(e.trade_date) AS oldest
+            FROM md.equities_daily e
+            JOIN md.symbols s ON e.symbol_id = s.symbol_id
+            GROUP BY s.symbol
+            """
+        )
+        return {r["symbol"]: str(r["oldest"]) for r in rows}
+
+    def get_existing_symbols(self) -> set[str]:
+        """Return the set of ticker symbols that currently have data."""
+        rows = self.query(
+            """
+            SELECT DISTINCT s.symbol
+            FROM md.symbols s
+            JOIN md.equities_daily e ON s.symbol_id = e.symbol_id
+            """
+        )
+        return {r["symbol"] for r in rows}
+
+    def get_symbol_id(self, symbol: str) -> int:
+        """Compatibility helper mirroring the bronze storage interface."""
+        return self.upsert_symbol(symbol, "equity", "SMART")
+
+    def replace_ticker_rows(self, symbol: str, rows: list[dict]) -> int:
+        """Compatibility helper for tests and rebuild flows."""
+        symbol_id = self.get_symbol_id(symbol)
+        self.delete_equities_daily(symbol_id)
+        return self.insert_equities_daily(self._normalize_storage_rows(rows, symbol_id))
+
+    def merge_ticker_rows(self, symbol: str, rows: list[dict]) -> int:
+        """Compatibility helper for tests and rebuild flows."""
+        symbol_id = self.get_symbol_id(symbol)
+        return self.insert_equities_daily(self._normalize_storage_rows(rows, symbol_id))
+
+    def get_summary(self) -> list[dict]:
+        """Compatibility summary helper mirroring the bronze storage interface."""
+        return self.query(
+            """
+            SELECT s.symbol, count(*) AS rows, min(e.trade_date) AS earliest, max(e.trade_date) AS latest
+            FROM md.equities_daily e
+            JOIN md.symbols s ON e.symbol_id = s.symbol_id
+            GROUP BY s.symbol
+            ORDER BY s.symbol
+            """
+        )
+
     # ── Query helpers ──────────────────────────────────────────────
 
     def query(self, sql: str, params: Optional[list] = None) -> list[dict]:
@@ -155,6 +227,24 @@ class DBClient:
         result = self._conn.execute(sql, params or [])
         columns = [desc[0] for desc in result.description]
         return [dict(zip(columns, row)) for row in result.fetchall()]
+
+    def _normalize_storage_rows(self, rows: list[dict], symbol_id: int) -> list[dict]:
+        """Normalize generic storage rows to the DB insert shape."""
+        normalized: list[dict] = []
+        for row in rows:
+            normalized.append(
+                {
+                    "trade_date": str(row["trade_date"]),
+                    "symbol_id": symbol_id,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "adj_close": float(row["adj_close"]),
+                    "volume": int(row["volume"]),
+                }
+            )
+        return normalized
 
     def get_equities_daily(
         self, symbol: str, start_date: Optional[str] = None, end_date: Optional[str] = None
@@ -211,3 +301,55 @@ class DBClient:
         )
         log.info("Wrote %s", out_path)
         return out_path
+
+    def replace_equities_from_parquet(self, bronze_dir: str | Path) -> dict[str, int]:
+        """Rebuild md.symbols and md.equities_daily from bronze parquet."""
+        bronze_dir = Path(bronze_dir)
+        parquet_files = list(bronze_dir.glob("symbol=*/data.parquet"))
+        parquet_glob = str(bronze_dir / "symbol=*/data.parquet").replace("'", "''")
+
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute("DELETE FROM md.equities_daily")
+            self._conn.execute("DELETE FROM md.symbols")
+            if parquet_files:
+                self._conn.execute(
+                    f"""
+                    INSERT INTO md.symbols (symbol_id, symbol, asset_class, venue)
+                    SELECT DISTINCT
+                        symbol_id,
+                        symbol,
+                        'equity' AS asset_class,
+                        'SMART' AS venue
+                    FROM read_parquet('{parquet_glob}', hive_partitioning=true)
+                    """
+                )
+                self._conn.execute(
+                    f"""
+                    INSERT INTO md.equities_daily
+                        (trade_date, symbol_id, open, high, low, close, adj_close, volume)
+                    SELECT
+                        trade_date,
+                        symbol_id,
+                        open,
+                        high,
+                        low,
+                        close,
+                        adj_close,
+                        volume
+                    FROM read_parquet('{parquet_glob}', hive_partitioning=true)
+                    """
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+        counts = self._conn.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM md.symbols) AS symbols,
+                (SELECT count(*) FROM md.equities_daily) AS rows
+            """
+        ).fetchone()
+        return {"symbols": counts[0], "rows": counts[1]}

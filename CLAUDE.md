@@ -9,7 +9,9 @@ Two directory trees: this **git repo** and the **data warehouse** at `~/market-w
 ```
 market-data-warehouse/              # Git repo
 ├── clients/
-│   ├── __init__.py                 # Exports IBClient, DBClient
+│   ├── __init__.py                 # Exports BronzeClient, DailyBarFallbackClient, IBClient, DBClient
+│   ├── bronze_client.py            # Canonical per-ticker bronze parquet client
+│   ├── daily_bar_fallback.py       # Public daily-bar fallback chain for U.S. equities/ETFs
 │   ├── ib_client.py                # Interactive Brokers API client (ib_insync)
 │   ├── uw_client.py                # Unusual Whales REST API client (kept, not used for historical)
 │   └── db_client.py                # DuckDB client for md.* schema
@@ -17,12 +19,14 @@ market-data-warehouse/              # Git repo
 │   ├── setup_market_warehouse.sh   # One-time system bootstrap
 │   ├── fetch_ib_historical.py      # Bulk historical OHLCV ingestion from IB (supports --backfill)
 │   ├── run_backfill_all.sh         # Auto-restarting runner for all presets
-│   ├── daily_update.py             # Daily incremental update (scheduled)
+│   ├── daily_update.py             # Daily parquet-first incremental update
+│   ├── rebuild_duckdb_from_parquet.py # Offline DuckDB rebuild from bronze parquet
 │   ├── run_daily_update.sh         # Shell wrapper for launchd/cron
 │   ├── com.market-warehouse.daily-update.plist.example  # macOS launchd template
 │   └── pre-commit-secrets-scan.sh  # Pre-commit hook: secrets scanner
 ├── tests/
 │   ├── conftest.py                 # Shared fixtures: tmp_duckdb, db
+│   ├── test_daily_bar_fallback.py  # Unit tests for fallback providers
 │   ├── test_uw_client.py           # Unit tests — HTTP mocked via `responses`
 │   ├── test_db_client.py           # Integration tests — temp DuckDB per test
 │   ├── test_fetch_ib_historical.py # Tests for IB fetch script
@@ -84,15 +88,17 @@ Data source: **Interactive Brokers** via `ib_insync`. Requires IB Gateway runnin
 - `IBClient` wraps `ib_insync.IB` with connection management, historical data, and contract qualification
 - `IBClient.connect()` defaults to `clientId=0` and automatically retries successive `clientId` values if IB reports error `326` (`client id already in use`)
 - `IBClient.get_historical_data()` fetches daily bars via `reqHistoricalData`
-- `DBClient` wraps DuckDB: `upsert_symbol()` uses deterministic hash-based IDs, `insert_equities_daily()` deduplicates via unique constraint, `delete_equities_daily()` clears old data before re-insert, `get_latest_dates()` returns `{symbol: latest_trade_date}` for gap detection
+- `BronzeClient` is the live service storage client: it discovers symbols from parquet, merges or replaces per-ticker snapshots, and publishes with `temp -> validate -> os.replace()`
+- `DailyBarFallbackClient` is a narrow recovery client for unresolved target-day gaps in the current U.S. equity universe. Provider order: Nasdaq `assetclass=stocks`, Nasdaq `assetclass=etf`, then Stooq U.S. daily CSV.
+- `DBClient` is now the offline analytical-file client: it can still manage/query `md.*`, and it rebuilds DuckDB from bronze parquet with set-based `INSERT INTO ... SELECT`
 - `adj_close` is set to `close` (IB TRADES data doesn't provide adjusted prices)
 
-### IB BarData → DuckDB mapping
+### IB BarData → Bronze mapping
 
-| IB BarData field | DuckDB column | Transform |
+| IB BarData field | Bronze column | Transform |
 |---|---|---|
 | `bar.date` | `trade_date` | `str(bar.date)` |
-| (from symbols) | `symbol_id` | Lookup/create in `md.symbols` |
+| (from ticker) | `symbol_id` | Read existing parquet ID or derive stable ID |
 | `bar.open` | `open` | Already float |
 | `bar.high` | `high` | Already float |
 | `bar.low` | `low` | Already float |
@@ -112,18 +118,19 @@ python scripts/fetch_ib_historical.py --preset presets/sp500.json --backfill  # 
 ```
 
 Current fetch behavior:
-- Normal mode still does `delete -> insert` per ticker in DuckDB
-- After each successful ticker write, the script rewrites that ticker's bronze snapshot at `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`
+- Normal mode atomically replaces the per-ticker bronze snapshot
+- Backfill mode merges older bars into the same per-ticker bronze snapshot
+- The live service path does not open `market.duckdb`
 - If IB returns an empty head timestamp, the fetcher falls back to `IB_EARLIEST_DATE` instead of skipping the symbol
 
 ### Backfill mode
 
-`--backfill` fetches only missing older data for tickers already in DB:
-- Queries each ticker's oldest existing `trade_date`
+`--backfill` fetches only missing older data for tickers already in bronze parquet:
+- Queries each ticker's oldest existing `trade_date` from parquet
 - Fetches IB inception → oldest_date gap
-- Inserts without deleting (dedup via unique constraint)
+- Merges older rows into the canonical parquet snapshot
 - Uses separate cursor JSON: `cursor_backfill_{name}.json`
-- Skips tickers not in DB (use normal fetch first)
+- Skips tickers not in bronze parquet (use normal fetch first)
 
 ### Auto-restarting runner
 
@@ -131,11 +138,11 @@ Current fetch behavior:
 bash scripts/run_backfill_all.sh   # Runs all presets with stall detection + auto-restart
 ```
 
-Output: DuckDB rows + per-ticker bronze Parquet at `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`.
+Output: per-ticker bronze Parquet at `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`. DuckDB is rebuilt separately when needed.
 
 ### Daily updates
 
-`daily_update.py` is a lightweight script for daily scheduled runs (~2,500 tickers). It discovers tickers from DB, detects gaps vs the latest trading day, fetches only missing bars, validates OHLCV integrity, and inserts (no delete). Idempotent and safe for concurrent runs.
+`daily_update.py` is a lightweight script for daily scheduled runs (~2,500 tickers). It discovers tickers from bronze parquet, detects gaps vs the latest trading day, fetches only missing bars, validates OHLCV integrity, and atomically rewrites only the affected per-ticker snapshots. If IB leaves unresolved target trading days after validation, the script can recover those dates from the fallback chain before publishing parquet.
 
 ```bash
 source ~/market-warehouse/.venv/bin/activate
@@ -156,12 +163,24 @@ launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update.plist
 Runs at 13:05 Pacific local time daily (4:05 PM Eastern year-round). Non-trading days are harmless no-ops.
 
 **Key design:**
-- Discovers tickers from DB via `DBClient.get_latest_dates()` — no hardcoded lists
-- Insert-only (dedup via unique constraint) — no delete, no data loss risk
+- Discovers tickers from parquet via `BronzeClient.get_latest_dates()` — no hardcoded lists
+- Live service writes avoid DuckDB file-lock contention
 - Bar validation: checks OHLCV relationships, positive prices, valid trading days, duplicate dates
-- Rewrites a per-ticker bronze snapshot after each successful insert
+- Atomically rewrites a per-ticker bronze snapshot after each successful merge
+- Recovery path for unresolved target-day gaps: Nasdaq historical quote API (`stocks`, then `etf`) and then Stooq `symbol.us`
+- Fallback bars use the same validation and bronze merge path as IB bars
+- Run summary exposes `Fallback attempts`, `Fallback successes`, and `Fallback symbols`
 - Pure-Python NYSE trading calendar — no new dependencies
 - Logs to `~/market-warehouse/logs/daily_update_YYYY-MM-DD.log`
+
+### Rebuilding DuckDB
+
+```bash
+source ~/market-warehouse/.venv/bin/activate
+python scripts/rebuild_duckdb_from_parquet.py
+```
+
+This repopulates `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree when you want a fresh analytical DB file.
 
 ### Querying
 
@@ -179,6 +198,7 @@ source ~/market-warehouse/.venv/bin/activate
 python -m pytest tests/ -v                                                        # Run all
 python -m pytest tests/ -v --cov=clients --cov=scripts --cov-report=term-missing  # With coverage
 python -m pytest tests/ -v -m "not integration"                                   # Unit tests only
+python -m pytest tests/ -v -W error::RuntimeWarning                               # Catch leaked coroutine warnings
 ```
 
 ### Rules for new code
@@ -188,8 +208,9 @@ python -m pytest tests/ -v -m "not integration"                                 
 3. Use `tmp_duckdb` / `db` fixtures from `conftest.py` for DB tests
 4. Mark DB tests with `@pytest.mark.integration`
 5. Run coverage and confirm 100% before committing
-6. `pyproject.toml` enforces `fail_under = 100`; `if __name__ == "__main__"` blocks are excluded
-7. `clients/ib_client.py` is excluded from the coverage fail-under gate, but focused behavior tests now live in `tests/test_ib_client.py`
+6. Run `-W error::RuntimeWarning` at least once before committing when script tests mock async runners such as `ib.ib.run(...)`
+7. `pyproject.toml` enforces `fail_under = 100`; `if __name__ == "__main__"` blocks are excluded
+8. `clients/ib_client.py` is excluded from the coverage fail-under gate, but focused behavior tests now live in `tests/test_ib_client.py`
 
 ### Test deps
 
@@ -208,9 +229,9 @@ Catches: AWS keys, API key/secret/password assignments, private key headers, Git
 ## Key Implementation Details
 
 - IB BarData provides native float/int types — no string parsing needed
-- `symbol_id` is `abs(hash(symbol)) % 2^53` for deterministic IDs
-- Fetch script does delete-then-insert per ticker: `delete_equities_daily()` then `insert_equities_daily()`
+- `symbol_id` is now a stable 53-bit hash from `blake2b(symbol)` for new symbols
+- Live ingestion writes bronze parquet directly; DuckDB is rebuilt from bronze when needed
 - Empty IB head timestamps now fall back to the earliest supported IB historical date instead of skipping the symbol
-- Bronze Parquet uses per-ticker Hive-partitioned layout: `data-lake/bronze/asset_class=equity/symbol=AAPL/data.parquet`. Written incrementally after each ticker's DuckDB insert. DuckDB can be rebuilt from Parquet via `read_parquet('bronze/asset_class=equity/symbol=*/data.parquet', hive_partitioning=true)`
-- Current bronze publication is still a DuckDB-derived per-ticker snapshot rewrite, not yet an atomic staged publish flow
+- Bronze Parquet uses per-ticker Hive-partitioned layout: `data-lake/bronze/asset_class=equity/symbol=AAPL/data.parquet`
+- Bronze publication is atomic at the file level: write temp parquet, validate it, then `os.replace()` into place
 - `IBClient.connect()` auto-retries successive `clientId` values after IB error `326`, then records the actual connected ID

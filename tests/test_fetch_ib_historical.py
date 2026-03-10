@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from ib_insync import Stock
 
+from clients.bronze_client import BronzeClient
 from scripts.fetch_ib_historical import (
     IB_EARLIEST_DATE,
     _cursor_path,
@@ -43,6 +44,12 @@ from scripts.fetch_ib_historical import (
 def _make_bar(date="2025-01-02", open=150.0, high=155.0, low=149.0, close=153.0, volume=1000000):
     """Create a mock IB BarData object."""
     return SimpleNamespace(date=date, open=open, high=high, low=low, close=close, volume=volume)
+
+
+def _seed_bronze(bronze_dir, symbol, rows):
+    """Write a canonical bronze snapshot for *symbol*."""
+    with BronzeClient(bronze_dir=bronze_dir) as bronze:
+        bronze.replace_ticker_rows(symbol, rows)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -466,32 +473,33 @@ class TestFetchAllTickers:
 
 class TestFetchTicker:
     @pytest.mark.integration
-    def test_fetch_inserts_bars(self, db):
+    def test_fetch_inserts_bars(self, bronze):
         """Happy path: pre-fetched bars are inserted."""
         bars = [
             _make_bar(date="2025-01-02", close=153.0),
             _make_bar(date="2025-01-03", close=156.0),
         ]
 
-        inserted = fetch_ticker("AAPL", bars, db)
+        inserted = fetch_ticker("AAPL", bars, bronze)
         assert inserted == 2
+        rows = bronze.read_symbol_rows("AAPL")
+        assert [row["trade_date"] for row in rows] == ["2025-01-02", "2025-01-03"]
 
     @pytest.mark.integration
-    def test_fetch_empty_bars_returns_zero(self, db):
+    def test_fetch_empty_bars_returns_zero(self, bronze):
         """Empty bars list returns zero."""
-        inserted = fetch_ticker("XYZ", [], db)
+        inserted = fetch_ticker("XYZ", [], bronze)
         assert inserted == 0
 
     @pytest.mark.integration
-    def test_fetch_deletes_old_data_before_insert(self, db):
+    def test_fetch_deletes_old_data_before_insert(self, bronze):
         """Verify delete-then-insert flow overwrites existing data."""
-        # Seed existing data
-        sid = db.upsert_symbol("AAPL", "equity", "SMART")
-        db.insert_equities_daily(
+        bronze.replace_ticker_rows(
+            "AAPL",
             [
                 {
                     "trade_date": "2024-06-01",
-                    "symbol_id": sid,
+                    "symbol_id": bronze.get_symbol_id("AAPL"),
                     "open": 100.0,
                     "high": 105.0,
                     "low": 99.0,
@@ -503,14 +511,12 @@ class TestFetchTicker:
         )
 
         bars = [_make_bar(date="2025-01-02", close=200.0)]
-        inserted = fetch_ticker("AAPL", bars, db)
+        inserted = fetch_ticker("AAPL", bars, bronze)
         assert inserted == 1
 
-        # Old row should be gone
-        result = db.query(
-            "SELECT count(*) AS cnt FROM md.equities_daily WHERE symbol_id = ?", [sid]
-        )
-        assert result[0]["cnt"] == 1
+        rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 1
+        assert rows[0]["trade_date"] == "2025-01-02"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -520,13 +526,13 @@ class TestFetchTicker:
 
 class TestGetExistingSymbols:
     @pytest.mark.integration
-    def test_returns_symbols_with_data(self, db):
-        sid = db.upsert_symbol("AAPL", "equity", "SMART")
-        db.insert_equities_daily(
+    def test_returns_symbols_with_data(self, bronze):
+        bronze.replace_ticker_rows(
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": bronze.get_symbol_id("AAPL"),
                     "open": 150.0,
                     "high": 155.0,
                     "low": 149.0,
@@ -536,58 +542,54 @@ class TestGetExistingSymbols:
                 }
             ]
         )
-        # Symbol with no daily data should NOT appear
-        db.upsert_symbol("MSFT", "equity", "SMART")
-
-        result = get_existing_symbols(db)
+        result = get_existing_symbols(bronze)
         assert result == {"AAPL"}
 
     @pytest.mark.integration
-    def test_returns_empty_when_no_data(self, db):
-        result = get_existing_symbols(db)
+    def test_returns_empty_when_no_data(self, bronze):
+        result = get_existing_symbols(bronze)
         assert result == set()
 
 
 class TestGetOldestDates:
     @pytest.mark.integration
-    def test_returns_oldest_dates(self, db):
-        sid = db.upsert_symbol("AAPL", "equity", "SMART")
-        db.insert_equities_daily(
+    def test_returns_oldest_dates(self, bronze):
+        bronze.replace_ticker_rows(
+            "AAPL",
             [
                 {
                     "trade_date": "2020-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": bronze.get_symbol_id("AAPL"),
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 },
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": bronze.get_symbol_id("AAPL"),
                     "open": 200.0, "high": 205.0, "low": 199.0,
                     "close": 203.0, "adj_close": 203.0, "volume": 2000000,
                 },
             ]
         )
-        result = get_oldest_dates(db)
+        result = get_oldest_dates(bronze)
         assert result == {"AAPL": "2020-01-02"}
 
     @pytest.mark.integration
-    def test_returns_empty_when_no_data(self, db):
-        result = get_oldest_dates(db)
+    def test_returns_empty_when_no_data(self, bronze):
+        result = get_oldest_dates(bronze)
         assert result == {}
 
 
 class TestBackfillTicker:
     @pytest.mark.integration
-    def test_inserts_without_deleting(self, db):
+    def test_inserts_without_deleting(self, bronze):
         """backfill_ticker inserts new rows without removing existing data."""
-        # Seed existing data
-        sid = db.upsert_symbol("AAPL", "equity", "SMART")
-        db.insert_equities_daily(
+        bronze.replace_ticker_rows(
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": bronze.get_symbol_id("AAPL"),
                     "open": 200.0, "high": 205.0, "low": 199.0,
                     "close": 203.0, "adj_close": 203.0, "volume": 2000000,
                 }
@@ -596,18 +598,16 @@ class TestBackfillTicker:
 
         # Backfill older data
         bars = [_make_bar(date="2020-01-02", close=100.0)]
-        inserted = backfill_ticker("AAPL", bars, db)
+        inserted = backfill_ticker("AAPL", bars, bronze)
         assert inserted == 1
 
-        # Both old and new rows should exist
-        result = db.query(
-            "SELECT count(*) AS cnt FROM md.equities_daily WHERE symbol_id = ?", [sid]
-        )
-        assert result[0]["cnt"] == 2
+        rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 2
+        assert [row["trade_date"] for row in rows] == ["2020-01-02", "2025-01-02"]
 
     @pytest.mark.integration
-    def test_empty_bars_returns_zero(self, db):
-        inserted = backfill_ticker("XYZ", [], db)
+    def test_empty_bars_returns_zero(self, bronze):
+        inserted = backfill_ticker("XYZ", [], bronze)
         assert inserted == 0
 
 
@@ -618,17 +618,21 @@ class TestBackfillTicker:
 
 def _mock_ib_instance(ticker_bars):
     """Create a mock IBClient context manager returning *ticker_bars*."""
+    def _run(awaitable):
+        awaitable.close()
+        return ticker_bars
+
     mock = MagicMock()
     mock.__enter__ = MagicMock(return_value=mock)
     mock.__exit__ = MagicMock(return_value=False)
-    mock.ib.run.return_value = ticker_bars
+    mock.ib.run.side_effect = _run
     return mock
 
 
 class TestMain:
     @pytest.mark.integration
-    def test_main_end_to_end(self, tmp_duckdb, tmp_path, monkeypatch):
-        """Full integration: main() with mocked IB client and temp DuckDB."""
+    def test_main_end_to_end(self, tmp_path, monkeypatch):
+        """Full integration: main() with mocked IB client and bronze parquet."""
         monkeypatch.setattr("sys.argv", ["fetch_ib_historical.py", "--tickers", "AAPL"])
 
         mock_ib = _mock_ib_instance({
@@ -644,10 +648,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", bronze_dir),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", cursor_dir),
@@ -665,7 +667,7 @@ class TestMain:
         assert "AAPL" in data["completed"]
 
     @pytest.mark.integration
-    def test_main_handles_empty_bars(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_handles_empty_bars(self, tmp_path, monkeypatch):
         """main() handles tickers with empty bars gracefully (not added to cursor)."""
         monkeypatch.setattr("sys.argv", ["fetch_ib_historical.py", "--tickers", "FAIL"])
 
@@ -675,10 +677,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", cursor_dir),
@@ -689,7 +689,7 @@ class TestMain:
         assert not (cursor_dir / "cursor_custom.json").exists()
 
     @pytest.mark.integration
-    def test_main_custom_args(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_custom_args(self, tmp_path, monkeypatch):
         """main() respects --port, --max-concurrent, --batch-size args."""
         monkeypatch.setattr(
             "sys.argv",
@@ -702,10 +702,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
@@ -718,7 +716,7 @@ class TestMain:
         assert run_call is not None
 
     @pytest.mark.integration
-    def test_main_with_preset(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_with_preset(self, tmp_path, monkeypatch):
         """main() loads tickers from a preset file."""
         preset = {"name": "test-preset", "tickers": ["AAPL", "NVDA"]}
         preset_file = tmp_path / "preset.json"
@@ -738,10 +736,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", cursor_dir),
@@ -755,7 +751,7 @@ class TestMain:
         assert set(data["completed"]) == {"AAPL", "NVDA"}
 
     @pytest.mark.integration
-    def test_main_resumes_from_cursor(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_resumes_from_cursor(self, tmp_path, monkeypatch):
         """main() skips already-completed tickers from cursor."""
         preset = {"name": "resume-test", "tickers": ["AAPL", "MSFT", "NVDA"]}
         preset_file = tmp_path / "preset.json"
@@ -785,10 +781,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", cursor_dir),
@@ -803,7 +797,7 @@ class TestMain:
         assert set(data["completed"]) == {"AAPL", "MSFT", "NVDA"}
 
     @pytest.mark.integration
-    def test_main_reset_clears_cursor(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_reset_clears_cursor(self, tmp_path, monkeypatch):
         """main() with --reset clears existing cursor."""
         # Pre-seed cursor
         cursor_dir = tmp_path / "cursors"
@@ -821,10 +815,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", cursor_dir),
@@ -835,7 +827,7 @@ class TestMain:
         mock_ib.ib.run.assert_called_once()
 
     @pytest.mark.integration
-    def test_main_all_completed_early_return(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_all_completed_early_return(self, tmp_path, monkeypatch):
         """main() returns early when all tickers are already completed."""
         # Pre-seed cursor with all tickers completed
         cursor_dir = tmp_path / "cursors"
@@ -863,7 +855,7 @@ class TestMain:
         mock_ib.connect.assert_not_called()
 
     @pytest.mark.integration
-    def test_main_default_mag7(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_default_mag7(self, tmp_path, monkeypatch):
         """main() uses MAG7 when no --tickers or --preset specified."""
         monkeypatch.setattr("sys.argv", ["fetch_ib_historical.py"])
 
@@ -873,10 +865,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
@@ -890,7 +880,7 @@ class TestMain:
         assert set(data["completed"]) == {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"}
 
     @pytest.mark.integration
-    def test_main_batching(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_batching(self, tmp_path, monkeypatch):
         """main() splits tickers into batches of --batch-size."""
         monkeypatch.setattr(
             "sys.argv",
@@ -906,10 +896,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
@@ -920,18 +908,16 @@ class TestMain:
         assert mock_ib.ib.run.call_count == 2
 
     @pytest.mark.integration
-    def test_main_skip_existing(self, tmp_duckdb, tmp_path, monkeypatch):
-        """main() with --skip-existing skips tickers already in DuckDB."""
-        # Pre-seed AAPL into the DB
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+    def test_main_skip_existing(self, tmp_path, monkeypatch):
+        """main() with --skip-existing skips tickers already in bronze."""
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0,
                     "high": 155.0,
                     "low": 149.0,
@@ -941,7 +927,6 @@ class TestMain:
                 }
             ]
         )
-        seed_db.close()
 
         monkeypatch.setattr(
             "sys.argv",
@@ -954,12 +939,10 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.fetch_ib_historical.BRONZE_DIR", bronze_dir),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
         ):
             main()
@@ -972,24 +955,21 @@ class TestMain:
         assert set(data["completed"]) == {"AAPL", "NVDA"}
 
     @pytest.mark.integration
-    def test_main_backfill_end_to_end(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_backfill_end_to_end(self, tmp_path, monkeypatch):
         """main() with --backfill fetches only older missing data."""
-        from clients.db_client import DBClient as RealDBClient
-
-        # Pre-seed AAPL with data starting from 2020-01-02
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2020-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         monkeypatch.setattr(
             "sys.argv",
@@ -1004,23 +984,18 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.fetch_ib_historical.BRONZE_DIR", bronze_dir),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
         ):
             main()
 
-        # Both old (2020) and backfilled (2019) rows should exist
-        check_db = RealDBClient(db_path=tmp_duckdb)
-        result = check_db.query(
-            "SELECT count(*) AS cnt FROM md.equities_daily WHERE symbol_id = ?", [sid]
-        )
-        assert result[0]["cnt"] == 2
-        check_db.close()
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 2
+        assert [row["trade_date"] for row in rows] == ["2019-06-15", "2020-01-02"]
 
         # Cursor should use backfill_ prefix
         cursor_file = tmp_path / "cursors" / "cursor_backfill_custom.json"
@@ -1029,7 +1004,7 @@ class TestMain:
         assert "AAPL" in data["completed"]
 
     @pytest.mark.integration
-    def test_main_backfill_skips_tickers_not_in_db(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_backfill_skips_tickers_not_in_bronze(self, tmp_path, monkeypatch):
         """main() with --backfill skips tickers that have no existing data."""
         monkeypatch.setattr(
             "sys.argv",
@@ -1041,10 +1016,8 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=tmp_path / "bronze"),
             ),
             patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
@@ -1055,23 +1028,21 @@ class TestMain:
         mock_ib.ib.run.assert_not_called()
 
     @pytest.mark.integration
-    def test_main_backfill_empty_bars(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_backfill_empty_bars(self, tmp_path, monkeypatch):
         """main() with --backfill handles empty bars for a ticker."""
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2020-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0, "high": 155.0, "low": 149.0,
                     "close": 153.0, "adj_close": 153.0, "volume": 1000000,
                 }
             ]
         )
-        seed_db.close()
 
         monkeypatch.setattr(
             "sys.argv",
@@ -1084,36 +1055,30 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
-            patch("scripts.fetch_ib_historical.BRONZE_DIR", tmp_path / "bronze"),
+            patch("scripts.fetch_ib_historical.BRONZE_DIR", bronze_dir),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
         ):
             main()
 
-        # Original row should still exist, nothing deleted
-        check_db = RealDBClient(db_path=tmp_duckdb)
-        result = check_db.query(
-            "SELECT count(*) AS cnt FROM md.equities_daily WHERE symbol_id = ?", [sid]
-        )
-        assert result[0]["cnt"] == 1
-        check_db.close()
+        with BronzeClient(bronze_dir=bronze_dir) as bronze:
+            rows = bronze.read_symbol_rows("AAPL")
+        assert len(rows) == 1
+        assert rows[0]["trade_date"] == "2020-01-02"
 
     @pytest.mark.integration
-    def test_main_skip_existing_all_in_db(self, tmp_duckdb, tmp_path, monkeypatch):
+    def test_main_skip_existing_all_in_bronze(self, tmp_path, monkeypatch):
         """main() with --skip-existing returns early when all tickers exist."""
-        from clients.db_client import DBClient as RealDBClient
-
-        seed_db = RealDBClient(db_path=tmp_duckdb)
-        sid = seed_db.upsert_symbol("AAPL", "equity", "SMART")
-        seed_db.insert_equities_daily(
+        bronze_dir = tmp_path / "bronze"
+        _seed_bronze(
+            bronze_dir,
+            "AAPL",
             [
                 {
                     "trade_date": "2025-01-02",
-                    "symbol_id": sid,
+                    "symbol_id": 1,
                     "open": 150.0,
                     "high": 155.0,
                     "low": 149.0,
@@ -1123,7 +1088,6 @@ class TestMain:
                 }
             ]
         )
-        seed_db.close()
 
         monkeypatch.setattr(
             "sys.argv",
@@ -1135,12 +1099,11 @@ class TestMain:
         with (
             patch("scripts.fetch_ib_historical.IBClient", return_value=mock_ib),
             patch(
-                "scripts.fetch_ib_historical.DBClient",
-                lambda **kw: __import__("clients.db_client", fromlist=["DBClient"]).DBClient(
-                    db_path=tmp_duckdb
-                ),
+                "scripts.fetch_ib_historical.BronzeClient",
+                lambda **kw: BronzeClient(bronze_dir=bronze_dir),
             ),
             patch("scripts.fetch_ib_historical.CURSOR_DIR", tmp_path / "cursors"),
+            patch("scripts.fetch_ib_historical.BRONZE_DIR", bronze_dir),
         ):
             main()
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Fetch historical daily OHLCV data from Interactive Brokers — inception to present.
+"""Fetch historical daily OHLCV data from Interactive Brokers into bronze parquet.
 
 Parallelises requests using ib_insync's async API with a semaphore to respect
 IB's pacing limit (~6 concurrent historical-data requests).
 
-Populates:
-  - DuckDB md.symbols + md.equities_daily (delete + re-insert per ticker)
-  - data-lake/bronze/asset_class=equity/ (normalized Parquet)
+Publishes:
+  - data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet
 
 Requires IB Gateway or TWS running on localhost.
 
@@ -31,7 +30,7 @@ Usage:
     # Custom IB Gateway port and concurrency:
     python scripts/fetch_ib_historical.py --port 7497 --max-concurrent 4
 
-    # Backfill missing older data for tickers already in DB:
+    # Backfill missing older data for tickers already in bronze parquet:
     python scripts/fetch_ib_historical.py --preset presets/sp500.json --backfill
 """
 
@@ -55,8 +54,20 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from clients.db_client import DBClient
+from clients.bronze_client import BronzeClient
 from clients.ib_client import IBClient, IBError
+
+_DEFAULT_STORAGE_CLIENT = BronzeClient
+DBClient = BronzeClient
+
+
+def _storage_client():
+    """Return the live storage client, allowing tests to patch either name."""
+    if BronzeClient is not _DEFAULT_STORAGE_CLIENT:
+        return BronzeClient
+    if DBClient is not _DEFAULT_STORAGE_CLIENT:
+        return DBClient
+    return BronzeClient
 
 # ── Config ─────────────────────────────────────────────────────────────
 
@@ -304,78 +315,51 @@ async def fetch_all_tickers(
     return results
 
 
-# ── Per-ticker DB ops ─────────────────────────────────────────────────
+# ── Per-ticker bronze ops ─────────────────────────────────────────────
 
 
 def fetch_ticker(
     ticker: str,
     bars: list,
-    db: DBClient,
+    bronze: BronzeClient,
 ) -> int:
-    """Persist pre-fetched bars for *ticker* into DuckDB + Parquet. Returns row count."""
+    """Persist pre-fetched bars for *ticker* into bronze parquet."""
     if not bars:
         console.print(f"  [yellow]No bar data for {ticker}[/yellow]")
         return 0
 
-    symbol_id = db.upsert_symbol(ticker, "equity", "SMART")
-
-    # Delete old data then insert fresh
-    db.delete_equities_daily(symbol_id)
+    symbol_id = bronze.get_symbol_id(ticker)
     rows = bars_to_rows(bars, symbol_id)
-    inserted = db.insert_equities_daily(rows)
-
-    # Write per-ticker Parquet
-    db.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
-
+    inserted = bronze.replace_ticker_rows(ticker, rows)
+    if hasattr(bronze, "write_ticker_parquet"):
+        bronze.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
     return inserted
 
 
-# ── DB helpers ────────────────────────────────────────────────────────
+# ── Bronze helpers ────────────────────────────────────────────────────
 
 
-def get_existing_symbols(db: DBClient) -> set[str]:
-    """Return the set of ticker symbols that already have equities_daily data."""
-    rows = db.query(
-        """
-        SELECT DISTINCT s.symbol
-        FROM md.symbols s
-        JOIN md.equities_daily e ON s.symbol_id = e.symbol_id
-        """
-    )
-    return {r["symbol"] for r in rows}
+def get_existing_symbols(bronze: BronzeClient) -> set[str]:
+    """Return the set of ticker symbols that already have bronze data."""
+    return bronze.get_existing_symbols()
 
 
-def get_oldest_dates(db: DBClient) -> dict[str, str]:
+def get_oldest_dates(bronze: BronzeClient) -> dict[str, str]:
     """Return ``{symbol: oldest_trade_date_str}`` for each ticker with data."""
-    rows = db.query(
-        """
-        SELECT s.symbol, MIN(e.trade_date) AS oldest
-        FROM md.equities_daily e
-        JOIN md.symbols s ON e.symbol_id = s.symbol_id
-        GROUP BY s.symbol
-        """
-    )
-    return {r["symbol"]: str(r["oldest"]) for r in rows}
+    return bronze.get_oldest_dates()
 
 
-def backfill_ticker(ticker: str, bars: list, db: DBClient) -> int:
-    """Insert backfill bars for *ticker* without deleting existing data.
-
-    Unlike ``fetch_ticker``, this skips the delete step. Dedup is handled
-    by the unique constraint on ``(trade_date, symbol_id)``.
-    Returns row count inserted.
-    """
+def backfill_ticker(ticker: str, bars: list, bronze: BronzeClient) -> int:
+    """Insert backfill bars for *ticker* without deleting existing data."""
     if not bars:
         console.print(f"  [yellow]No backfill data for {ticker}[/yellow]")
         return 0
 
-    symbol_id = db.upsert_symbol(ticker, "equity", "SMART")
+    symbol_id = bronze.get_symbol_id(ticker)
     rows = bars_to_rows(bars, symbol_id)
-    inserted = db.insert_equities_daily(rows)
-
-    # Write per-ticker Parquet (includes both old + backfilled data)
-    db.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
-
+    inserted = bronze.merge_ticker_rows(ticker, rows)
+    if hasattr(bronze, "write_ticker_parquet"):
+        bronze.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
     return inserted
 
 
@@ -405,7 +389,7 @@ def main():
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip tickers that already have data in DuckDB",
+        help="Skip tickers that already have bronze parquet data",
     )
     parser.add_argument(
         "--years",
@@ -434,7 +418,7 @@ def main():
     parser.add_argument(
         "--backfill",
         action="store_true",
-        help="Backfill mode: fetch only missing older data for tickers already in DB",
+        help="Backfill mode: fetch only missing older data for tickers already in bronze parquet",
     )
     args = parser.parse_args()
 
@@ -489,17 +473,17 @@ def main():
     else:
         started_at = datetime.now().isoformat()
 
-    # ── Skip existing (requires DB connection) ────────────────────────
+    # ── Live bronze publication ───────────────────────────────────────
     run_t0 = time.monotonic()
 
-    with IBClient() as ib, DBClient() as db:
+    with IBClient() as ib, _storage_client()(bronze_dir=BRONZE_DIR) as bronze:
         ib.connect(port=args.port)
 
         if args.backfill:
-            _run_backfill(args, ib, db, all_tickers, remaining, completed,
+            _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
                           effective_cursor, started_at)
         else:
-            _run_normal(args, ib, db, all_tickers, remaining, completed,
+            _run_normal(args, ib, bronze, all_tickers, remaining, completed,
                         effective_cursor, started_at)
 
         run_elapsed = time.monotonic() - run_t0
@@ -507,17 +491,9 @@ def main():
         console.print(f"[bold]Run elapsed:[/bold] {run_elapsed:.1f}s")
 
         # Summary
-        summary = db.query(
-            """
-            SELECT s.symbol, count(*) as rows, min(e.trade_date) as earliest, max(e.trade_date) as latest
-            FROM md.equities_daily e
-            JOIN md.symbols s ON e.symbol_id = s.symbol_id
-            GROUP BY s.symbol
-            ORDER BY s.symbol
-            """
-        )
+        summary = bronze.get_summary()
         if summary:
-            console.print(f"\n[bold]Data summary ({len(summary)} symbols in DB):[/bold]")
+            console.print(f"\n[bold]Data summary ({len(summary)} symbols in bronze):[/bold]")
             for row in summary:
                 console.print(
                     f"  {row['symbol']:6s}  {row['rows']:>6,d} rows  "
@@ -527,17 +503,17 @@ def main():
     console.print("\n[green bold]Done.[/green bold]\n")
 
 
-def _run_backfill(args, ib, db, all_tickers, remaining, completed,
+def _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
                   cursor_name, started_at):
-    """Backfill mode: fetch only missing older data for tickers already in DB."""
-    oldest_dates = get_oldest_dates(db)
+    """Backfill mode: fetch only missing older data for tickers already in bronze."""
+    oldest_dates = get_oldest_dates(bronze)
 
-    # Filter to tickers that exist in DB (have oldest dates)
+    # Filter to tickers that already have bronze snapshots.
     backfill_tickers = [t for t in remaining if t in oldest_dates]
     skipped_new = [t for t in remaining if t not in oldest_dates]
     if skipped_new:
         console.print(
-            f"[cyan]Skipping {len(skipped_new)} tickers not yet in DB"
+            f"[cyan]Skipping {len(skipped_new)} tickers not yet in bronze"
             f" (use normal fetch first):[/cyan] [dim]{' '.join(skipped_new)}[/dim]"
         )
 
@@ -591,7 +567,7 @@ def _run_backfill(args, ib, db, all_tickers, remaining, completed,
             for ticker in batch:
                 progress.update(task, description=f"Backfilling {ticker}...")
                 bars = ticker_bars.get(ticker, [])
-                count = backfill_ticker(ticker, bars, db)
+                count = backfill_ticker(ticker, bars, bronze)
 
                 if count > 0:
                     completed.add(ticker)
@@ -623,24 +599,26 @@ def _run_backfill(args, ib, db, all_tickers, remaining, completed,
     console.print(f"[bold]Cursor:[/bold] {len(completed)}/{len(all_tickers)} tickers saved")
 
 
-def _run_normal(args, ib, db, all_tickers, remaining, completed,
+def _run_normal(args, ib, bronze, all_tickers, remaining, completed,
                 cursor_name, started_at):
-    """Normal fetch mode: delete + re-insert per ticker."""
+    """Normal fetch mode: replace the per-ticker bronze snapshot."""
     if args.skip_existing:
-        existing = get_existing_symbols(db)
+        existing = get_existing_symbols(bronze)
         skipped = [t for t in remaining if t in existing]
         if skipped:
             completed.update(skipped)
             save_cursor(cursor_name, completed, started_at)
             remaining = [t for t in remaining if t not in existing]
             console.print(
-                f"[cyan]Skipped {len(skipped)} tickers already in DB:[/cyan] "
+                f"[cyan]Skipped {len(skipped)} tickers already in bronze:[/cyan] "
                 f"[dim]{' '.join(skipped)}[/dim]"
             )
         console.print(f"[bold]{len(remaining)} tickers to fetch after skip-existing[/bold]")
 
     if not remaining:
-        console.print("[green bold]All tickers already in DB. Use --reset to re-run.[/green bold]\n")
+        console.print(
+            "[green bold]All tickers already in bronze. Use --reset to re-run.[/green bold]\n"
+        )
         return
 
     batches = [remaining[i:i + args.batch_size] for i in range(0, len(remaining), args.batch_size)]
@@ -678,7 +656,7 @@ def _run_normal(args, ib, db, all_tickers, remaining, completed,
             for ticker in batch:
                 progress.update(task, description=f"Inserting {ticker}...")
                 bars = ticker_bars.get(ticker, [])
-                count = fetch_ticker(ticker, bars, db)
+                count = fetch_ticker(ticker, bars, bronze)
 
                 if count > 0:
                     completed.add(ticker)

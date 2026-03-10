@@ -11,12 +11,14 @@ The main change is architectural: bronze becomes a first-class publish target, n
 ## Current Pressure Points
 
 - The codebase has already improved two failure modes: `fetch_ib_historical.py` falls back to the earliest supported IB historical date when head timestamps are empty, and `IBClient.connect()` retries successive `clientId` values on IB error `326`.
-- `scripts/fetch_ib_historical.py` fetches bars into Python lists, converts them into Python dict rows, deletes existing rows in normal mode, then inserts row-by-row into DuckDB.
-- `clients/db_client.py` loops over every row and catches duplicates one row at a time, which is the slowest part of the current write path.
+- `scripts/fetch_ib_historical.py` and `scripts/daily_update.py` now publish directly into per-ticker bronze parquet, which removed the live DuckDB lock from the hot path.
+- `scripts/daily_update.py` now also has a narrow public fallback chain for unresolved target-day gaps in the U.S. equity universe (`nasdaq:stocks` -> `nasdaq:etf` -> `stooq:us`). That improves recoverability for symbol-level IB failures, but it introduces source-order policy and per-provider observability needs.
+- `clients/bronze_client.py` still rewrites a full per-ticker snapshot for each affected symbol, so merge cost scales with ticker history rather than with the incremental bar count.
+- `clients/db_client.py` is now an offline analytical-file client and rebuild target, not the service system of record.
 - `scripts/fetch_ib_historical.py` now falls back to `IB_EARLIEST_DATE` when IB returns no head timestamp. That keeps more symbols fetchable, but it also makes request volume and empty-window behavior more important to observe.
 - Cursor state only records completed tickers. It does not track run ownership, window-level progress, lease expiry, or per-mode conflicts, so overlapping backfills are possible.
 - Preset loading is duplicated in ingestion scripts. Universe metadata exists in JSON already, but is not treated as a domain model.
-- Bronze publication now rewrites one DuckDB-derived snapshot per ticker under `symbol=<ticker>/data.parquet`. That is a meaningful improvement over a single global export, but it is still non-atomic, still tied to post-DB state, and still rewrites full ticker history on each update.
+- Bronze publication now rewrites one canonical snapshot per ticker under `symbol=<ticker>/data.parquet` and uses a file-level atomic publish. That removed DuckDB lock contention, but it still rewrites full ticker history on each update and does not yet use staged manifests or lease-backed orchestration.
 - `clients/ib_client.py` now retries successive `clientId` values on IB error `326`, but that path is not yet instrumented with retry counts, actual connected ID, or launchd-friendly diagnostics.
 
 ## Design Principles

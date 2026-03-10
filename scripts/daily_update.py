@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Daily market data update — append latest bars for tickers already in the DB.
+"""Daily market data update — append latest bars for tickers in bronze parquet.
 
 Lightweight alternative to fetch_ib_historical.py for daily scheduled runs.
-Discovers tickers from DB, detects gaps, fetches only missing bars, validates,
-and inserts (no delete). Safe for concurrent/repeated runs (idempotent via
-unique constraint dedup).
+Discovers tickers from bronze parquet, detects gaps, fetches only missing bars,
+uses a narrow public fallback chain for unresolved trading dates after IB, and
+atomically rewrites per-ticker snapshots.
 
 Requires IB Gateway or TWS running on localhost.
 
 Usage:
     source ~/market-warehouse/.venv/bin/activate
 
-    # Normal daily run (discovers all tickers from DB):
+    # Normal daily run (discovers all tickers from bronze parquet):
     python scripts/daily_update.py
 
     # Dry-run — show gap report without fetching:
@@ -46,8 +46,34 @@ from rich.logging import RichHandler
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from clients.db_client import DBClient
+from clients.bronze_client import BronzeClient
+from clients.daily_bar_fallback import DailyBarFallbackClient
 from clients.ib_client import IBClient, IBError
+
+_DEFAULT_STORAGE_CLIENT = BronzeClient
+DBClient = BronzeClient
+
+
+def _storage_client():
+    """Return the live storage client, allowing tests to patch either name."""
+    if BronzeClient is not _DEFAULT_STORAGE_CLIENT:
+        return BronzeClient
+    if DBClient is not _DEFAULT_STORAGE_CLIENT:
+        return DBClient
+    return BronzeClient
+
+
+_DEFAULT_FALLBACK_CLIENT = DailyBarFallbackClient
+FallbackClient = DailyBarFallbackClient
+
+
+def _fallback_client():
+    """Return the live fallback client, allowing tests to patch either name."""
+    if DailyBarFallbackClient is not _DEFAULT_FALLBACK_CLIENT:
+        return DailyBarFallbackClient()
+    if FallbackClient is not _DEFAULT_FALLBACK_CLIENT:
+        return FallbackClient()
+    return DailyBarFallbackClient()
 
 # ── Config ─────────────────────────────────────────────────────────────
 
@@ -209,6 +235,27 @@ def compute_ib_duration(latest_date: date, target_date: date) -> str:
         return "2 Y"
 
 
+def get_missing_trading_dates(
+    latest_date: date,
+    target_date: date,
+    bars: list,
+) -> list[date]:
+    """Return unresolved trading dates in ``(latest_date, target_date]``."""
+    covered = {
+        date.fromisoformat(str(bar.date))
+        for bar in bars
+        if latest_date < date.fromisoformat(str(bar.date)) <= target_date
+    }
+
+    missing: list[date] = []
+    cursor = latest_date + timedelta(days=1)
+    while cursor <= target_date:
+        if is_trading_day(cursor) and cursor not in covered:
+            missing.append(cursor)
+        cursor += timedelta(days=1)
+    return missing
+
+
 # ── Bar validation ─────────────────────────────────────────────────────
 
 
@@ -277,7 +324,7 @@ def validate_bars(
 
 
 def bars_to_rows(bars: list, symbol_id: int) -> list[dict]:
-    """Convert IB BarData objects to md.equities_daily row dicts."""
+    """Convert IB BarData objects to bronze row dicts."""
     rows = []
     for bar in bars:
         rows.append(
@@ -293,6 +340,25 @@ def bars_to_rows(bars: list, symbol_id: int) -> list[dict]:
             }
         )
     return rows
+
+
+def fetch_fallback_bars(
+    ticker: str,
+    missing_dates: list[date],
+    fallback_client,
+) -> tuple[list, list[str]]:
+    """Fetch fallback bars for unresolved trading dates."""
+    bars: list = []
+    sources: list[str] = []
+
+    for trade_date in missing_dates:
+        fallback_bar = fallback_client.get_daily_bar(ticker, trade_date)
+        if fallback_bar is None:
+            continue
+        bars.append(fallback_bar)
+        sources.append(fallback_bar.source)
+
+    return (bars, sources)
 
 
 # ── Async fetching ─────────────────────────────────────────────────────
@@ -411,18 +477,20 @@ def main():
         console.print(f"[bold]Preset:[/bold] {preset_name} ({len(preset_tickers)} tickers)")
 
     # ── Gap detection ───────────────────────────────────────────────
-    with DBClient() as db:
-        latest_dates = db.get_latest_dates()
+    with _storage_client()(bronze_dir=BRONZE_DIR) as bronze:
+        latest_dates = bronze.get_latest_dates()
 
         if not latest_dates:
-            console.print("[yellow]No tickers found in DB. Run fetch_ib_historical.py first.[/yellow]")
+            console.print(
+                "[yellow]No tickers found in bronze parquet. Run fetch_ib_historical.py first.[/yellow]"
+            )
             return
 
         # Filter to preset tickers if specified
         if preset_tickers is not None:
             latest_dates = {k: v for k, v in latest_dates.items() if k in preset_tickers}
             if not latest_dates:
-                console.print("[yellow]No preset tickers found in DB.[/yellow]")
+                console.print("[yellow]No preset tickers found in bronze parquet.[/yellow]")
                 return
 
         up_to_date, single_gap, multi_gap = classify_gaps(latest_dates, target)
@@ -459,8 +527,11 @@ def main():
         total_issues: list[str] = []
         tickers_updated = 0
         tickers_failed = 0
+        fallback_attempts = 0
+        fallback_successes = 0
+        fallback_symbols = 0
 
-        with IBClient() as ib:
+        with IBClient() as ib, _fallback_client() as fallback:
             ib.connect(port=args.port)
 
             batches = [
@@ -480,43 +551,69 @@ def main():
 
                 for ticker, duration in batch:
                     bars = ticker_bars.get(ticker, [])
-                    if not bars:
-                        console.print(f"  [yellow]{ticker}[/yellow]: no bars returned")
-                        tickers_failed += 1
-                        continue
-
                     valid_bars, issues = validate_bars(bars, ticker)
                     total_issues.extend(issues)
                     total_validated += len(bars)
 
-                    if not valid_bars:
-                        console.print(f"  [yellow]{ticker}[/yellow]: all bars failed validation")
-                        tickers_failed += 1
-                        continue
-
-                    # Filter to only bars after the latest date in DB
+                    # Filter to only bars after the latest parquet date
                     latest = date.fromisoformat(latest_dates[ticker])
                     valid_bars = [
                         b for b in valid_bars
                         if date.fromisoformat(str(b.date)) > latest
                     ]
 
+                    missing_dates = get_missing_trading_dates(latest, target, valid_bars)
+                    fallback_attempts += len(missing_dates)
+                    fallback_bars, fallback_sources = fetch_fallback_bars(
+                        ticker, missing_dates, fallback,
+                    )
+                    if fallback_bars:
+                        recovered_bars, fallback_issues = validate_bars(fallback_bars, ticker)
+                        total_issues.extend(fallback_issues)
+                        total_validated += len(fallback_bars)
+                        if recovered_bars:
+                            valid_bars.extend(recovered_bars)
+                            fallback_successes += len(recovered_bars)
+                            fallback_symbols += 1
+                            console.print(
+                                f"  [cyan]{ticker}[/cyan]: recovered "
+                                f"{len(recovered_bars)} missing trading day"
+                                f"{'s' if len(recovered_bars) != 1 else ''} via "
+                                f"{', '.join(sorted(set(fallback_sources)))}"
+                            )
+
                     if not valid_bars:
-                        console.print(f"  [dim]{ticker}[/dim]: no new bars after {latest}")
-                        tickers_updated += 1
+                        if bars:
+                            console.print(
+                                f"  [yellow]{ticker}[/yellow]: no valid target bar from IB or fallback"
+                            )
+                        else:
+                            console.print(
+                                f"  [yellow]{ticker}[/yellow]: no bars from IB and no fallback bar"
+                            )
+                        tickers_failed += 1
                         continue
 
-                    symbol_id = db.upsert_symbol(ticker, "equity", "SMART")
+                    symbol_id = bronze.get_symbol_id(ticker)
                     rows = bars_to_rows(valid_bars, symbol_id)
-                    inserted = db.insert_equities_daily(rows)
+                    inserted = bronze.merge_ticker_rows(ticker, rows)
+                    if hasattr(bronze, "write_ticker_parquet"):
+                        bronze.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
+                    remaining_dates = get_missing_trading_dates(latest, target, valid_bars)
                     total_inserted += inserted
+
+                    if remaining_dates:
+                        console.print(
+                            f"  [yellow]{ticker}[/yellow]: "
+                            f"{inserted} bar{'s' if inserted != 1 else ''} published, "
+                            f"still missing {', '.join(d.isoformat() for d in remaining_dates)}"
+                        )
+                        tickers_failed += 1
+                        continue
+
                     tickers_updated += 1
-
-                    # Write per-ticker Parquet
-                    db.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
-
                     console.print(
-                        f"  [green]{ticker}[/green]: {inserted} bar{'s' if inserted != 1 else ''} inserted"
+                        f"  [green]{ticker}[/green]: {inserted} bar{'s' if inserted != 1 else ''} published"
                     )
 
     # ── Summary ─────────────────────────────────────────────────────
@@ -524,6 +621,9 @@ def main():
     console.print(f"[bold]Daily Update Complete[/bold]")
     console.print(f"  Tickers updated:    {tickers_updated}")
     console.print(f"  Tickers failed:     {tickers_failed}")
+    console.print(f"  Fallback attempts:  {fallback_attempts}")
+    console.print(f"  Fallback successes: {fallback_successes}")
+    console.print(f"  Fallback symbols:   {fallback_symbols}")
     console.print(f"  Bars inserted:      {total_inserted}")
     console.print(f"  Bars validated:     {total_validated}")
     console.print(f"  Validation issues:  {len(total_issues)}")

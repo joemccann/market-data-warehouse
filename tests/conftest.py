@@ -5,6 +5,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 
+from clients.bronze_client import BronzeClient
 from clients.db_client import DBClient
 
 
@@ -53,4 +54,19 @@ def db(tmp_duckdb):
     yield client
     client.close()
 
+
+@pytest.fixture()
+def tmp_bronze(tmp_path):
+    """Create a temporary bronze parquet root."""
+    bronze_dir = tmp_path / "bronze"
+    bronze_dir.mkdir(parents=True, exist_ok=True)
+    return bronze_dir
+
+
+@pytest.fixture()
+def bronze(tmp_bronze):
+    """Provide a BronzeClient connected to a fresh temp bronze root."""
+    client = BronzeClient(bronze_dir=tmp_bronze)
+    yield client
+    client.close()
 
