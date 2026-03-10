@@ -6,6 +6,8 @@ Developer reference for the Interactive Brokers TWS API as used via the `ib_insy
 
 ## Connection
 
+For this repo, the normal live endpoint comes from the global machine-local secure IBC service `local.ibc-gateway`, which runs IB Gateway for the user under `~/ibc` and `~/Library/LaunchAgents`. That service is required for IB-backed project workflows, but it is not scoped to this repo.
+
 ### Ports
 | Mode | IB Gateway | TWS |
 |------|-----------|-----|

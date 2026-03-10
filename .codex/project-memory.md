@@ -25,6 +25,8 @@ Use this file for:
   - Nasdaq historical quote API with `assetclass=etf`
   - Stooq U.S. daily CSV
 - `IBClient.connect()` already retries successive `clientId` values after IB error `326`.
+- Preferred IBC startup on macOS is the machine-local secure service installed by `scripts/install_ibc_secure_service.py`, which writes wrappers under `~/ibc/bin`, a LaunchAgent under `~/Library/LaunchAgents/local.ibc-gateway.plist`, and renders a temporary runtime config from `~/ibc/config.secure.ini` plus Keychain secrets instead of storing IB credentials in plaintext config.
+- For this repo, the secure IBC service is a required machine-local dependency for IB-backed workflows, but the service itself is global to the user's Mac rather than scoped to this repo.
 - `symbol_id` for new symbols is a stable 53-bit `blake2b(symbol)`-derived value.
 
 ## Durable Workflow Rules

@@ -61,7 +61,8 @@ Current live shape:
 
 ## Operational Facts
 
-- IB Gateway is expected on `127.0.0.1:4001` unless overridden.
+- For this repo, IB Gateway is expected on `127.0.0.1:4001` via the global machine-local secure IBC service installed under `~/ibc`, `~/ibc-install`, and `~/Library/LaunchAgents/local.ibc-gateway.plist`.
+- That secure IBC service is required for IB-backed workflows in this repo, but the service itself is not scoped to this repo and should be treated as shared machine-local infrastructure.
 - `IBClient.connect()` already retries successive `clientId` values after IB error `326`.
 - `scripts/daily_update.py` is the scheduled parquet-first daily sync.
 - `scripts/rebuild_duckdb_from_parquet.py` rebuilds DuckDB from bronze when a local DB file is needed.

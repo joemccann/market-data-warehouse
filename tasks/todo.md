@@ -3,27 +3,28 @@
 Use this file for the current task only. Replace it at the start of each non-trivial task.
 
 ## Objective
-- Stage the current repo changes and create a git commit that accurately describes the latest preset and ignore-file updates.
+- Audit and update all repo docs so the secure IBC path is documented as a global machine-local service required for this project but not scoped to this project.
 
 ## Success Criteria
-- The current modified and untracked files intended for this task are reviewed before staging.
-- A commit is created for the latest changes with a message derived from the actual diff.
-- `git status --short` is clean after the commit.
+- Every repo doc that describes IBC setup, startup, or runtime behavior is updated to reference the secure service consistently.
+- The docs state that the secure IBC service is installed globally under `~/ibc` and `~/Library/LaunchAgents`, is required for this project, and is not project-scoped.
+- The docs consistently use the service label `local.ibc-gateway`.
+- A final audit confirms no contradictory IBC guidance remains in the updated doc set.
 
 ## Dependency Graph
 - T1 -> T2 -> T3 -> T4
 
 ## Tasks
-- [x] T1 Inspect the current worktree and capture a commit plan in this file
+- [x] T1 Record the documentation audit plan
   depends_on: []
-- [x] T2 Review the changed files to determine commit scope and message
+- [x] T2 Audit all repo docs that describe IBC setup, startup, or runtime behavior
   depends_on: [T1]
-- [x] T3 Stage the latest files and create the git commit
+- [x] T3 Update the relevant docs to describe the secure global machine-local IBC service
   depends_on: [T2]
-- [x] T4 Verify the resulting worktree state and record the review summary
+- [x] T4 Verify doc consistency and update review notes
   depends_on: [T3]
 
 ## Review
-- Outcome: Created commit `3c4f022` with the current `.gitignore` update and the new ADR and ETF preset files.
-- Verification: Confirmed the staged diff before commit and re-ran `git status --short` after commit; the worktree was clean before this review update.
-- Residual risk: `presets/etfs.json` is a large static universe list, so future maintenance depends on the source used to generate it staying current.
+- Outcome: Updated the IBC documentation in `README.md`, `CLAUDE.md`, and `.codex/project-memory.md` so the secure path is consistently described as the global machine-local service `local.ibc-gateway`, required for this project but not scoped to this repo.
+- Verification: Audited the doc surface with `rg` across the repo docs and manually re-read the updated IBC sections in `README.md`, `CLAUDE.md`, and `.codex/project-memory.md` to confirm the service label, install locations, and dependency model now match.
+- Residual risk: the default Keychain service names remain compatibility defaults (`com.market-warehouse.ibc.*`), so the docs call that out explicitly to avoid implying those item names define the scope of the installed service.

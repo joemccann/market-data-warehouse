@@ -51,6 +51,8 @@ In one sentence:
 
 IBC automates IB Gateway startup, login, reconnection, and daily restarts — making API connections robust and hands-free.
 
+For this repo, IBC is a required machine-local dependency for any workflow that talks to Interactive Brokers. The secure service lives under `~/ibc`, `~/ibc-install`, and `~/Library/LaunchAgents` on the user's Mac. It is required for this project, but it is not scoped to this repo and should be treated as a global local service.
+
 ### Installation
 
 1. Download the latest macOS release from [IBC Releases](https://github.com/IbcAlpha/IBC/releases/latest)
@@ -59,15 +61,13 @@ IBC automates IB Gateway startup, login, reconnection, and daily restarts — ma
    mkdir -p ~/ibc-install && unzip IBCMacos-*.zip -d ~/ibc-install
    chmod +x ~/ibc-install/*.sh ~/ibc-install/scripts/*.sh
    ```
-3. Copy and edit the config:
+3. Copy the IBC config to the secure launcher config path:
    ```bash
    mkdir -p ~/ibc ~/ibc/logs
-   cp ~/ibc-install/config.ini ~/ibc/config.ini
+   cp ~/ibc-install/config.ini ~/ibc/config.secure.ini
    ```
-4. Edit `~/ibc/config.ini` — set your credentials and these key settings:
+4. Edit `~/ibc/config.secure.ini` with the non-secret settings only, and remove any `IbLoginId=` / `IbPassword=` lines:
    ```ini
-   IbLoginId=YOUR_IB_USERNAME
-   IbPassword=YOUR_IB_PASSWORD
    TradingMode=live
    AcceptIncomingConnectionAction=accept
    ExistingSessionDetectedAction=primary
@@ -76,22 +76,65 @@ IBC automates IB Gateway startup, login, reconnection, and daily restarts — ma
    ColdRestartTime=07:05
    CommandServerPort=7462
    ```
-5. Edit `~/ibc-install/gatewaystartmacos.sh` — set the version and paths:
+5. Store the IB username and password in the macOS Keychain and trust `/usr/bin/security` for non-interactive reads:
    ```bash
-   TWS_MAJOR_VRSN=10.44          # Match your installed Gateway version
-   IBC_INI=~/ibc/config.ini
-   TRADING_MODE=live
-   TWOFA_TIMEOUT_ACTION=restart
-   IBC_PATH=~/ibc-install
-   TWS_PATH=~/Applications
-   LOG_PATH=~/ibc/logs
+   security add-generic-password -a ibc -s com.market-warehouse.ibc.username -w 'YOUR_IB_USERNAME' -U -T /usr/bin/security
+   security add-generic-password -a ibc -s com.market-warehouse.ibc.password -w 'YOUR_IB_PASSWORD' -U -T /usr/bin/security
    ```
+   If you already created these items without `-T /usr/bin/security`, re-run the same commands with `-U` to update the trusted-app access list.
+   These keychain service names are compatibility defaults used by the installer and launcher. They are configurable, and the installed IBC service itself remains a machine-global service rather than a repo-scoped one.
 
-### Starting Gateway via IBC
+6. Install the machine-local secure service:
 
 ```bash
-~/ibc-install/gatewaystartmacos.sh
+python scripts/install_ibc_secure_service.py
 ```
+
+This installer provisions the global local IBC service required by this project. It writes:
+
+- `~/ibc/bin/run-secure-ibc-gateway.sh`
+- `~/ibc/bin/start-secure-ibc-service.sh`
+- `~/ibc/bin/stop-secure-ibc-service.sh`
+- `~/ibc/bin/restart-secure-ibc-service.sh`
+- `~/ibc/bin/status-secure-ibc-service.sh`
+- `~/Library/LaunchAgents/local.ibc-gateway.plist`
+
+If a legacy `com.market-warehouse.ibc-gateway` or `com.convex-scavenger.ibc-gateway` LaunchAgent already exists, the installer preserves its `StartCalendarInterval`, moves the old plist aside, and bootstraps `local.ibc-gateway` instead.
+
+You can override paths with flags if your install differs:
+
+```bash
+python scripts/install_ibc_secure_service.py \
+  --ibc-dir ~/ibc \
+  --ibc-install-dir ~/ibc-install \
+  --applications-dir ~/Applications \
+  --tws-settings-path ~/Jts
+```
+
+The installed runner reads the username and password from Keychain at runtime, writes a temporary `0600` runtime config file, passes only the temp config path to IBC, and removes the temp file after IBC exits. Once installed, the service no longer depends on another repo checkout path and should be managed as a machine-level service rather than a project-owned daemon.
+
+### Keychain Access Behavior
+
+- You should not need to approve access on every launch if the items were created with `-T /usr/bin/security` and your login keychain is already unlocked.
+- Run this as your logged-in user, for example from a `LaunchAgent`, not a system `LaunchDaemon`.
+- If the login keychain is locked or the items were created without the trusted-app entry, macOS can still prompt you.
+
+### Secure IBC Service Commands
+
+```bash
+~/ibc/bin/start-secure-ibc-service.sh
+~/ibc/bin/stop-secure-ibc-service.sh
+~/ibc/bin/restart-secure-ibc-service.sh
+~/ibc/bin/status-secure-ibc-service.sh
+```
+
+The LaunchAgent label is `local.ibc-gateway`.
+
+### Project Dependency Model
+
+- This project requires a working local IBC service whenever you run IB-backed ingestion or daily update flows.
+- The service is global to the machine, not scoped to this repo, and can be shared by multiple local projects that use the same IB Gateway install.
+- The repo provides an installer and documentation for that service, but the installed artifacts live under the user's home directory rather than inside the repo.
 
 ### IBC Commands (while Gateway is running)
 
@@ -113,8 +156,24 @@ IBC automates IB Gateway startup, login, reconnection, and daily restarts — ma
 ### IBC Logs
 
 ```bash
-cat ~/ibc/logs/ibc-*.txt   # Current session log
+cat ~/ibc/logs/ibc-*.txt   # Current session log from the stock IBC wrapper
 ```
+
+The secure LaunchAgent writes stdout/stderr to `~/ibc/logs/ibc-gateway-service.log`.
+
+### Low-Level Direct Launch
+
+For troubleshooting, the repo still includes a direct launcher:
+
+```bash
+python scripts/start_ibc_gateway_keychain.py --tws-major-version 10.44
+```
+
+This is a low-level fallback. The installed machine-local service above is the preferred operational path.
+
+### Legacy Plaintext Startup
+
+IBC's stock `~/ibc-install/gatewaystartmacos.sh` still works with a plaintext `~/ibc/config.ini`, but this repo now recommends the global secure service above instead of storing `IbLoginId` and `IbPassword` on disk.
 
 ### IB Connection Behavior in This Repo
 
@@ -126,7 +185,7 @@ cat ~/ibc/logs/ibc-*.txt   # Current session log
 
 ### Prerequisites
 
-Requires **IB Gateway** running on localhost via IBC (recommended) or manually. Default port: `4001`.
+Requires **IB Gateway** running on localhost via IBC. For this repo, the recommended and documented path is the installed secure machine-local service `local.ibc-gateway`; manual startup is only a fallback. Default port: `4001`.
 
 ### Fetch Historical OHLCV
 

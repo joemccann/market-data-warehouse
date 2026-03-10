@@ -71,10 +71,15 @@ ClickHouse mirrors the same schema with MergeTree engines partitioned by `toYYYY
 
 IB Gateway is managed by **IBC** (IB Controller) for automated login, reconnection, and daily restarts.
 
+For this repo, IBC is a required machine-local dependency for IB-backed workflows. The secure service is installed globally under the user's home directory and is not scoped to this repo.
+
 - **IBC install**: `~/ibc-install/` (IBC.jar + scripts)
-- **IBC config**: `~/ibc/config.ini` (credentials + settings)
-- **IBC logs**: `~/ibc/logs/`
-- **Start Gateway**: `~/ibc-install/gatewaystartmacos.sh`
+- **IBC secure config**: `~/ibc/config.secure.ini` (settings only; no credentials)
+- **IBC secure service installer**: `python scripts/install_ibc_secure_service.py`
+- **IBC machine-local wrappers**: `~/ibc/bin/start-secure-ibc-service.sh`, `stop-secure-ibc-service.sh`, `restart-secure-ibc-service.sh`, `status-secure-ibc-service.sh`
+- **IBC LaunchAgent**: `~/Library/LaunchAgents/local.ibc-gateway.plist`
+- **IBC logs**: `~/ibc/logs/ibc-gateway-service.log` for the secure LaunchAgent, or `~/ibc/logs/` for the stock wrapper
+- **Start Gateway**: installed machine-local secure service (preferred and project-required for IB workflows), repo Keychain launcher for low-level troubleshooting, or `~/ibc-install/gatewaystartmacos.sh` for legacy plaintext config
 - **Stop Gateway**: `~/ibc-install/stop.sh`
 - **Reconnect data**: `~/ibc-install/reconnectdata.sh`
 - **Command server**: port 7462
@@ -83,7 +88,7 @@ IB Gateway is managed by **IBC** (IB Controller) for automated login, reconnecti
 
 ## Data Ingestion
 
-Data source: **Interactive Brokers** via `ib_insync`. Requires IB Gateway running on localhost (via IBC).
+Data source: **Interactive Brokers** via `ib_insync`. Requires IB Gateway running on localhost via the global machine-local IBC service.
 
 - `IBClient` wraps `ib_insync.IB` with connection management, historical data, and contract qualification
 - `IBClient.connect()` defaults to `clientId=0` and automatically retries successive `clientId` values if IB reports error `326` (`client id already in use`)
