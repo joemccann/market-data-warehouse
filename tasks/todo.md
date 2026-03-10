@@ -18,10 +18,12 @@ Use this file for the current task only. Replace it at the start of each non-tri
   depends_on: []
 - [x] T2 Review the changed files to determine commit scope and message
   depends_on: [T1]
-- [ ] T3 Stage the latest files and create the git commit
+- [x] T3 Stage the latest files and create the git commit
   depends_on: [T2]
-- [ ] T4 Verify the resulting worktree state and record the review summary
+- [x] T4 Verify the resulting worktree state and record the review summary
   depends_on: [T3]
 
 ## Review
-- Pending.
+- Outcome: Created commit `3c4f022` with the current `.gitignore` update and the new ADR and ETF preset files.
+- Verification: Confirmed the staged diff before commit and re-ran `git status --short` after commit; the worktree was clean before this review update.
+- Residual risk: `presets/etfs.json` is a large static universe list, so future maintenance depends on the source used to generate it staying current.
