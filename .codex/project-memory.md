@@ -20,6 +20,9 @@ Use this file for:
 - DuckDB is rebuilt from bronze parquet when a local analytical DB file is needed.
 - `scripts/daily_update.py` is parquet-first and does not hold the live DuckDB write path.
 - `scripts/daily_update.py` supports `--target-date YYYY-MM-DD` for fixed-date catch-up runs and only publishes bars with `latest < trade_date <= target`.
+- Scheduled daily syncs now run through `scripts/run_daily_update_job.py`, which retries failures before sending Nodemailer-based terminal alerts.
+- A separate `scripts/check_daily_update_watchdog.py` watchdog is available to alert when the scheduled daily sync never starts or never writes a completion marker.
+- Failure alerts can now generate a human-readable Markdown incident report and include a Cerebras-generated summary plus proposed remediation in the email body when the AI config is available.
 - Daily syncs use IB as the primary source and only use fallback recovery for unresolved target-day gaps.
 - Current fallback scope is the repo's U.S. equity and ETF universe on the NYSE trading calendar.
 - Current fallback provider order is:
@@ -40,6 +43,7 @@ Use this file for:
 - For future macOS work, start with `macos/README.md` as the package index; it points at the live build paths, research docs, render artifacts, and launcher flow.
 - The repo-local macOS research set now includes `macos/docs/ai-chat-ux-best-practices.html`, `macos/docs/setup-and-settings-research.md`, and `macos/docs/metal-best-practices.md`.
 - The repo-local macOS assistant UX audit skill lives at `macos/.codex/skills/ai-chat-ux-best-practices/` and is the project-specific reference point for future UX review work inside `macos/`.
+- The repo-local quant backtesting skill lives at `.codex/skills/quant-backtest/` and should be used for future backtesting or systematic strategy tasks in this repo.
 
 ## Durable Workflow Rules
 
