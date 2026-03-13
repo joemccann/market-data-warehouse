@@ -44,7 +44,7 @@ Use this file for:
 - The repo-local macOS research set now includes `macos/docs/ai-chat-ux-best-practices.html`, `macos/docs/setup-and-settings-research.md`, and `macos/docs/metal-best-practices.md`.
 - The repo-local macOS assistant UX audit skill lives at `macos/.codex/skills/ai-chat-ux-best-practices/` and is the project-specific reference point for future UX review work inside `macos/`.
 - The repo-local quant backtesting skill lives at `.codex/skills/quant-backtest/` and should be used for future backtesting or systematic strategy tasks in this repo.
-- The repo-local breadth strategy entry point is `strategies/breadth_washout.py`; it supports `oversold` and `overbought` modes across named universes, custom presets, explicit ticker lists, and `all-stocks`, with official point-in-time membership implemented only for `ndx100`.
+- All backtesting and strategy code (breadth washout, overnight drift, intraday drift, NDX breadth, shared metrics) has been extracted to the standalone **doob** package at `~/dev/apps/finance/doob`. The `strategies/` directory in this repo is legacy and no longer the canonical source. Use `python -m doob run <strategy>` from the doob package.
 
 ## Durable Workflow Rules
 

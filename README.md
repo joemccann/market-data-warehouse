@@ -350,58 +350,28 @@ python scripts/rebuild_duckdb_from_parquet.py
 
 This rebuilds `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree using set-based `INSERT INTO ... SELECT FROM read_parquet(...)`. The rebuild path recreates the analytical tables from scratch on each run, so it is safe to rerun against an existing DuckDB file.
 
-## Breadth Strategy
+## Strategies (Extracted to doob)
 
-The repo now includes a generic breadth strategy entry point at `strategies/breadth_washout.py`.
+All backtesting and strategy code has been extracted to the standalone **[doob](../doob/)** package (`~/dev/apps/finance/doob`). The `strategies/` directory in this repo is kept for reference but is no longer the canonical source.
 
-Supported universe selectors:
-- `--universe ndx100`
-- `--universe sp500`
-- `--universe r2k`
-- `--universe all-stocks`
-- `--preset /path/to/preset.json`
-- `--tickers AAPL MSFT NVDA`
+The doob package includes:
+- **Breadth washout** — oversold/overbought signal modes across named universes (ndx100, sp500, r2k, all-stocks), custom presets, and explicit ticker lists
+- **NDX-100 SMA breadth** — breadth-analysis helpers and NDX-focused utilities
+- **Overnight drift** — buy SPY at close, sell next open, with VIX regime filter
+- **Intraday drift** — buy at open, sell at close (long or short)
+- **Shared metrics** — CAGR, Sharpe, max drawdown, VaR, IBKR fee model
 
-Supported signal modes:
-- `--signal-mode oversold`
-- `--signal-mode overbought`
-
-Default thresholds:
-- `oversold` defaults to `65`
-- `overbought` defaults to `70`
-
-Examples:
+### Quick start
 
 ```bash
+cd ~/dev/apps/finance/doob
 source ~/market-warehouse/.venv/bin/activate
+pip install -e ".[all]"
 
-# Oversold breadth on the S&P 500 preset
-python strategies/breadth_washout.py \
-  --universe sp500 \
-  --signal-mode oversold \
-  --assets QQQ TQQQ \
-  --end-date 2026-03-11
-
-# Overbought breadth on all discovered local symbols
-python strategies/breadth_washout.py \
-  --universe all-stocks \
-  --signal-mode overbought \
-  --assets QQQ TQQQ \
-  --end-date 2026-03-11
-
-# Custom ticker basket with an explicit threshold
-python strategies/breadth_washout.py \
-  --tickers AAPL MSFT NVDA \
-  --signal-mode overbought \
-  --threshold 70 \
-  --assets QQQ TQQQ \
-  --universe-label mega-cap-ai
+python -m doob list-strategies
+python -m doob run breadth-washout --universe sp500 --signal-mode oversold --end-date 2026-03-11
+python -m doob run overnight-drift --help
 ```
-
-Notes:
-- Official point-in-time membership is implemented only for `ndx100`.
-- Other universes currently run as static baskets derived from presets, explicit tickers, or the discovered bronze symbol set.
-- `--min-pct-below` remains as a backward-compatible oversold alias, but new runs should prefer `--signal-mode` plus `--threshold`.
 
 ### Scheduling with launchd (macOS)
 

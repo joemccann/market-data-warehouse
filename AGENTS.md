@@ -23,7 +23,7 @@ Current live shape:
 - DuckDB is a local analytical and rebuild target, not the live write path
 - Interactive Brokers is the primary source for ingestion
 - Daily syncs can recover unresolved target-day gaps for the current U.S. equity universe with a narrow external fallback chain
-- The repo-local breadth strategy entry point is `strategies/breadth_washout.py`, which supports `oversold` and `overbought` modes across named universes, presets, explicit ticker lists, and `all-stocks`
+- All backtesting and strategy code has been extracted to the standalone **doob** package at `~/dev/apps/finance/doob`; the `strategies/` directory here is legacy and no longer the canonical source
 - A native macOS client now lives under `macos/` with first-run setup, a Settings scene, provider-backed chat, raw DuckDB CLI passthrough, and hybrid SwiftUI plus MetalKit workspace surfaces
 - The long-term direction is broader multi-asset support and future ClickHouse publishing
 
@@ -73,7 +73,7 @@ Current live shape:
 - `IBClient.connect()` already retries successive `clientId` values after IB error `326`.
 - `scripts/daily_update.py` is the scheduled parquet-first daily sync and supports `--target-date YYYY-MM-DD` for fixed-date catch-up runs without publishing later bars.
 - `scripts/rebuild_duckdb_from_parquet.py` rebuilds DuckDB from bronze when a local DB file is needed and recreates the analytical tables from scratch on each run.
-- `strategies/breadth_washout.py` is the generic breadth strategy entry point; official point-in-time membership exists only for `ndx100`, while the other supported universes run as static baskets.
+- Strategy code (breadth washout, overnight drift, intraday drift, NDX breadth) has been extracted to the standalone `doob` package at `~/dev/apps/finance/doob`; the `strategies/` directory in this repo is legacy.
 - `macos/scripts/build_local_macos_app.sh` builds the local app bundle at `macos/build/Market Data Warehouse.app`.
 - `macos/scripts/compile_metal_library.sh` precompiles `OperatorPilotMetalShaders.metallib` for the local app bundle; if the compiler is missing, install the optional Xcode component with `xcodebuild -downloadComponent metalToolchain`.
 - `macos/scripts/run_ui_smoke_tests.sh` is the current end-to-end macOS UI verification path and covers setup, navigation, diagnostics, provider chat, source import, and parquet preview in an isolated session.
