@@ -1,4 +1,0 @@
-interface:
-  display_name: "Metal macOS Replatform"
-  short_description: "Best practices for Metal-backed macOS apps"
-  default_prompt: "Use $metal-macos-replatform to plan or implement a Metal-backed macOS desktop surface."

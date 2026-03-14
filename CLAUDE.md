@@ -30,12 +30,6 @@ market-data-warehouse/              # Git repo
 │   ├── com.market-warehouse.daily-update.plist.example  # macOS launchd template
 │   ├── com.market-warehouse.daily-update-watchdog.plist.example # macOS launchd watchdog template
 │   └── pre-commit-secrets-scan.sh  # Pre-commit hook: secrets scanner
-├── strategies/                     # Legacy — extracted to standalone doob package
-│   ├── breadth_washout.py          # (migrated to doob.strategies.breadth_washout)
-│   ├── ndx100_breadth_washout.py   # (migrated to doob.strategies.ndx100_breadth_washout)
-│   ├── ndx100_sma_breadth.py       # (migrated to doob.strategies.ndx100_sma_breadth)
-│   ├── overnight_drift.py          # (migrated to doob.strategies.overnight_drift)
-│   └── intraday_drift.py           # (migrated to doob.strategies.intraday_drift)
 ├── tests/
 │   ├── conftest.py                 # Shared fixtures: tmp_duckdb, db
 │   ├── test_daily_bar_fallback.py  # Unit tests for fallback providers
@@ -44,7 +38,6 @@ market-data-warehouse/              # Git repo
 │   ├── test_fetch_ib_historical.py # Tests for IB fetch script
 │   ├── test_daily_update.py        # Tests for daily update script
 │   └── test_ib_client.py           # Focused tests for IB client connect fallback
-├── macos/                          # Legacy — extracted to standalone Sift app at ~/dev/apps/util/sift
 ├── pyproject.toml                  # pytest config, coverage enforcement
 ├── .env.example
 └── README.md
@@ -79,13 +72,13 @@ All backtesting and strategy code has been extracted to the standalone **doob** 
 - Intraday drift (buy open, sell close)
 - Shared metrics (CAGR, Sharpe, max drawdown, VaR) and IBKR fee model
 
-The `strategies/` directory in this repo is kept for reference but is no longer the canonical source. Use `python -m doob run <strategy>` from the doob package instead.
+Use `python -m doob run <strategy>` from the doob package.
 
 See the [doob CLAUDE.md](~/dev/apps/finance/doob/CLAUDE.md) for strategy catalog and usage.
 
 ## Native macOS Client (Extracted)
 
-The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`. The `macos/` directory in this repo is kept for reference but is no longer the canonical source.
+The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`.
 
 See the [Sift CLAUDE.md](~/dev/apps/util/sift/CLAUDE.md) for module layout, build instructions, and testing.
 

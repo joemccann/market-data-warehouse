@@ -23,8 +23,8 @@ Current live shape:
 - DuckDB is a local analytical and rebuild target, not the live write path
 - Interactive Brokers is the primary source for ingestion
 - Daily syncs can recover unresolved target-day gaps for the current U.S. equity universe with a narrow external fallback chain
-- All backtesting and strategy code has been extracted to the standalone **doob** package at `~/dev/apps/finance/doob`; the `strategies/` directory here is legacy and no longer the canonical source
-- The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`; the `macos/` directory here is legacy
+- All backtesting and strategy code has been extracted to the standalone **doob** package at `~/dev/apps/finance/doob`
+- The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`
 - The long-term direction is broader multi-asset support and future ClickHouse publishing
 
 ## Working Rules
@@ -71,7 +71,7 @@ Current live shape:
 - `IBClient.connect()` already retries successive `clientId` values after IB error `326`.
 - `scripts/daily_update.py` is the scheduled parquet-first daily sync and supports `--target-date YYYY-MM-DD` for fixed-date catch-up runs without publishing later bars.
 - `scripts/rebuild_duckdb_from_parquet.py` rebuilds DuckDB from bronze when a local DB file is needed and recreates the analytical tables from scratch on each run.
-- Strategy code (breadth washout, overnight drift, intraday drift, NDX breadth) has been extracted to the standalone `doob` package at `~/dev/apps/finance/doob`; the `strategies/` directory in this repo is legacy.
+- Strategy code (breadth washout, overnight drift, intraday drift, NDX breadth) has been extracted to the standalone `doob` package at `~/dev/apps/finance/doob`.
 - The native macOS app (build scripts, Metal shaders, UI smoke tests) has been extracted to the standalone Sift repo at `~/dev/apps/util/sift/`.
 - Daily fallback provider order is:
   - Nasdaq historical quote API with `assetclass=stocks`

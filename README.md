@@ -29,7 +29,7 @@ In one sentence:
 
 ## Native macOS Client (Extracted)
 
-The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`. The `macos/` directory in this repo is kept for reference but is no longer the canonical source. See the Sift repo for build instructions, testing, and module layout.
+The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`. See the Sift repo for build instructions, testing, and module layout.
 
 ## Dependencies
 
@@ -309,7 +309,7 @@ This rebuilds `~/market-warehouse/duckdb/market.duckdb` from the canonical bronz
 
 ## Strategies (Extracted to doob)
 
-All backtesting and strategy code has been extracted to the standalone **[doob](../doob/)** package (`~/dev/apps/finance/doob`). The `strategies/` directory in this repo is kept for reference but is no longer the canonical source.
+All backtesting and strategy code has been extracted to the standalone **[doob](../doob/)** package (`~/dev/apps/finance/doob`).
 
 The doob package includes:
 - **Breadth washout** — oversold/overbought signal modes across named universes (ndx100, sp500, r2k, all-stocks), custom presets, and explicit ticker lists
