@@ -34,15 +34,7 @@ Use this file for:
 - Preferred IBC startup on macOS is the machine-local secure service installed by `scripts/install_ibc_secure_service.py`, which writes wrappers under `~/ibc/bin`, a LaunchAgent under `~/Library/LaunchAgents/local.ibc-gateway.plist`, and renders a temporary runtime config from `~/ibc/config.secure.ini` plus Keychain secrets instead of storing IB credentials in plaintext config.
 - For this repo, the secure IBC service is a required machine-local dependency for IB-backed workflows, but the service itself is global to the user's Mac rather than scoped to this repo.
 - `symbol_id` for new symbols is a stable 53-bit `blake2b(symbol)`-derived value.
-- The native macOS client work now lives under `macos/` as a repo-local Swift package that Xcode can open directly.
-- The selected initial macOS UI direction is `Option 3: Operator Pilot`.
-- The current macOS client includes first-run setup, a Settings scene, local session restore, provider-backed chat through installed CLIs, and raw DuckDB CLI passthrough via `/duckdb ...` plus the diagnostics drawer.
-- The macOS client now follows a hybrid SwiftUI plus MetalKit architecture: native shell controls with `MTKView`-backed workspace panels driven by a compact render snapshot model.
-- The local app bundle precompiles `OperatorPilotMetalShaders.metallib` with `macos/scripts/compile_metal_library.sh`; if the compiler is missing locally, install the optional Xcode component with `xcodebuild -downloadComponent metalToolchain`.
-- The macOS client now has a repo-local UI smoke harness at `macos/scripts/run_ui_smoke_tests.sh` that drives the built app through keyboard shortcuts and validates visible window text via OCR in an isolated throwaway session.
-- For future macOS work, start with `macos/README.md` as the package index; it points at the live build paths, research docs, render artifacts, and launcher flow.
-- The repo-local macOS research set now includes `macos/docs/ai-chat-ux-best-practices.html`, `macos/docs/setup-and-settings-research.md`, and `macos/docs/metal-best-practices.md`.
-- The repo-local macOS assistant UX audit skill lives at `macos/.codex/skills/ai-chat-ux-best-practices/` and is the project-specific reference point for future UX review work inside `macos/`.
+- The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`. The `macos/` directory in this repo is legacy and no longer the canonical source. For future macOS work, see the Sift repo.
 - The repo-local quant backtesting skill lives at `.codex/skills/quant-backtest/` and should be used for future backtesting or systematic strategy tasks in this repo.
 - All backtesting and strategy code (breadth washout, overnight drift, intraday drift, NDX breadth, shared metrics) has been extracted to the standalone **doob** package at `~/dev/apps/finance/doob`. The `strategies/` directory in this repo is legacy and no longer the canonical source. Use `python -m doob run <strategy>` from the doob package.
 

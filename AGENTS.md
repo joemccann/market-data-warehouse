@@ -9,7 +9,7 @@ At the start of every new Codex session in this repo:
 1. Read [CLAUDE.md](/Users/joemccann/dev/apps/finance/market-data-warehouse/CLAUDE.md) for implementation details, repo layout, and testing rules.
 2. Read [README.md](/Users/joemccann/dev/apps/finance/market-data-warehouse/README.md) for the current architecture, runtime behavior, and operator-facing commands.
 3. Read [.codex/project-memory.md](/Users/joemccann/dev/apps/finance/market-data-warehouse/.codex/project-memory.md) for durable project-specific memory that should persist across sessions.
-4. Read [macos/README.md](/Users/joemccann/dev/apps/finance/market-data-warehouse/macos/README.md) when the task touches the native desktop client.
+4. For native macOS client work, see the standalone Sift repo at `~/dev/apps/util/sift/`.
 5. Read [tasks/lessons.md](/Users/joemccann/dev/apps/finance/market-data-warehouse/tasks/lessons.md) when the task touches workflow, operational recovery, or a recently corrected mistake.
 6. Run `git status --short` before making assumptions about the worktree.
 
@@ -24,7 +24,7 @@ Current live shape:
 - Interactive Brokers is the primary source for ingestion
 - Daily syncs can recover unresolved target-day gaps for the current U.S. equity universe with a narrow external fallback chain
 - All backtesting and strategy code has been extracted to the standalone **doob** package at `~/dev/apps/finance/doob`; the `strategies/` directory here is legacy and no longer the canonical source
-- A native macOS client now lives under `macos/` with first-run setup, a Settings scene, provider-backed chat, raw DuckDB CLI passthrough, and hybrid SwiftUI plus MetalKit workspace surfaces
+- The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`; the `macos/` directory here is legacy
 - The long-term direction is broader multi-asset support and future ClickHouse publishing
 
 ## Working Rules
@@ -52,9 +52,7 @@ Current live shape:
 - Before finishing meaningful changes, run:
   - `source ~/market-warehouse/.venv/bin/activate`
   - `python -m pytest tests -q --cov=clients --cov=scripts --cov-report=term-missing`
-- When touching the macOS client, also run:
-  - `cd macos && swift test`
-  - `cd macos && ./scripts/run_ui_smoke_tests.sh`
+- The native macOS client tests are now in the standalone Sift repo at `~/dev/apps/util/sift/`
 - When script tests mock async runners such as `ib.ib.run(...)`, also run:
   - `python -m pytest tests -q -W error::RuntimeWarning`
 - When fixing a bug, add or update a regression test if it fits.
@@ -74,9 +72,7 @@ Current live shape:
 - `scripts/daily_update.py` is the scheduled parquet-first daily sync and supports `--target-date YYYY-MM-DD` for fixed-date catch-up runs without publishing later bars.
 - `scripts/rebuild_duckdb_from_parquet.py` rebuilds DuckDB from bronze when a local DB file is needed and recreates the analytical tables from scratch on each run.
 - Strategy code (breadth washout, overnight drift, intraday drift, NDX breadth) has been extracted to the standalone `doob` package at `~/dev/apps/finance/doob`; the `strategies/` directory in this repo is legacy.
-- `macos/scripts/build_local_macos_app.sh` builds the local app bundle at `macos/build/Market Data Warehouse.app`.
-- `macos/scripts/compile_metal_library.sh` precompiles `OperatorPilotMetalShaders.metallib` for the local app bundle; if the compiler is missing, install the optional Xcode component with `xcodebuild -downloadComponent metalToolchain`.
-- `macos/scripts/run_ui_smoke_tests.sh` is the current end-to-end macOS UI verification path and covers setup, navigation, diagnostics, provider chat, source import, and parquet preview in an isolated session.
+- The native macOS app (build scripts, Metal shaders, UI smoke tests) has been extracted to the standalone Sift repo at `~/dev/apps/util/sift/`.
 - Daily fallback provider order is:
   - Nasdaq historical quote API with `assetclass=stocks`
   - Nasdaq historical quote API with `assetclass=etf`

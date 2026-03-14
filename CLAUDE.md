@@ -44,14 +44,7 @@ market-data-warehouse/              # Git repo
 │   ├── test_fetch_ib_historical.py # Tests for IB fetch script
 │   ├── test_daily_update.py        # Tests for daily update script
 │   └── test_ib_client.py           # Focused tests for IB client connect fallback
-├── macos/
-│   ├── Package.swift               # Repo-local Swift package for the native macOS client
-│   ├── Sources/                    # Option 3 app shell, planner, provider, and CLI adapters
-│   ├── Tests/                      # Swift unit coverage for app seams and adapters
-│   ├── scripts/                    # Build, launcher, and UI smoke harness scripts
-│   ├── launcher/                   # Finder-friendly launcher sources/artifacts
-│   ├── docs/                       # Native-client design, auth, and implementation docs
-│   └── README.md                   # Operator guide for the macOS client
+├── macos/                          # Legacy — extracted to standalone Sift app at ~/dev/apps/util/sift
 ├── pyproject.toml                  # pytest config, coverage enforcement
 ├── .env.example
 └── README.md
@@ -90,15 +83,11 @@ The `strategies/` directory in this repo is kept for reference but is no longer 
 
 See the [doob CLAUDE.md](~/dev/apps/finance/doob/CLAUDE.md) for strategy catalog and usage.
 
-## Native macOS Client
+## Native macOS Client (Extracted)
 
-- The native client lives under `macos/` as a repo-local Swift package that Xcode can open directly.
-- The selected initial direction is `Option 3: Operator Pilot`.
-- First launch is gated by setup until a default chat provider is configured.
-- The app now uses a hybrid SwiftUI plus MetalKit architecture: native shell controls plus `MTKView`-backed workspace panels.
-- The app exposes a standard macOS Settings scene, command-key navigation, provider-backed chat through local `claude`, `codex`, or `gemini` CLIs, and raw DuckDB CLI passthrough via `/duckdb ...` plus the diagnostics drawer.
-- Local testing paths include `macos/scripts/build_local_macos_app.sh`, `macos/scripts/build_local_launcher.sh`, `macos/scripts/compile_metal_library.sh`, and the Finder launcher under `macos/launcher/`.
-- If the local Metal compiler is missing, install the optional Xcode component with `xcodebuild -downloadComponent metalToolchain`.
+The native macOS client has been extracted to the standalone **Sift** app at `~/dev/apps/util/sift/`. The `macos/` directory in this repo is kept for reference but is no longer the canonical source.
+
+See the [Sift CLAUDE.md](~/dev/apps/util/sift/CLAUDE.md) for module layout, build instructions, and testing.
 
 ## DuckDB Schema
 
@@ -260,8 +249,7 @@ python -m pytest tests/ -v                                                      
 python -m pytest tests/ -v --cov=clients --cov=scripts --cov-report=term-missing  # With coverage
 python -m pytest tests/ -v -m "not integration"                                   # Unit tests only
 python -m pytest tests/ -v -W error::RuntimeWarning                               # Catch leaked coroutine warnings
-cd macos && swift test                                                             # Native macOS unit coverage
-cd macos && ./scripts/run_ui_smoke_tests.sh                                        # Native macOS UI smoke flow
+# Native macOS tests are now in the standalone Sift repo at ~/dev/apps/util/sift
 ```
 
 ### Rules for new code
