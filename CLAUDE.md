@@ -17,6 +17,10 @@ market-data-warehouse/              # Git repo
 │   └── db_client.py                # DuckDB client for md.* schema
 ├── presets/
 │   ├── volatility.json             # CBOE Volatility Indices (VIX, VVIX, etc.)
+│   ├── futures-index.json          # CME/CBOT Index Futures (ES, NQ, RTY, YM)
+│   ├── futures-energy.json         # NYMEX Energy Futures (CL, NG)
+│   ├── futures-metals.json         # COMEX Metals Futures (GC, SI)
+│   ├── futures-treasuries.json     # CBOT Treasury Futures (ZB, ZN, ZF)
 │   └── ...                         # S&P 500, NDX-100, Russell 2000 sector presets
 ├── scripts/
 │   ├── setup_market_warehouse.sh   # One-time system bootstrap
@@ -49,6 +53,7 @@ market-data-warehouse/              # Git repo
 ├── .venv/                          # Python 3.12 venv
 ├── data-lake/
 │   ├── bronze/asset_class=equity/  # Per-ticker Hive-partitioned Parquet (symbol=AAPL/data.parquet)
+│   ├── bronze/asset_class=futures/ # Per-contract Hive-partitioned Parquet (symbol=ES_202506/data.parquet)
 │   ├── bronze-delisted/asset_class=equity/  # Archived delisted symbols excluded from future sync/backfill runs
 │   ├── silver/                     # Cleaned / adjusted
 │   └── gold/                       # Derived analytics / factor tables
@@ -91,7 +96,7 @@ Schema `md` with four tables:
 
 - `md.symbols` — `symbol_id BIGINT PK`, `symbol`, `asset_class`, `venue`
 - `md.equities_daily` — `trade_date DATE`, `symbol_id BIGINT`, OHLCV + `adj_close`; unique index on `(trade_date, symbol_id)` for dedup
-- `md.futures_daily` — trade_date, contract_id, root_symbol, expiry, OHLCV + settlement + OI
+- `md.futures_daily` — trade_date, contract_id, root_symbol, expiry_date, OHLCV + settlement + open_interest; unique index on `(trade_date, contract_id)` for dedup; no `md.symbols` entries — self-contained with embedded `root_symbol`
 - `md.options_daily` — trade_date, contract_id, underlier_id, expiry, strike, `option_right` (not `right` — reserved keyword), OHLCV + OI + implied_vol
 
 ClickHouse mirrors the same schema with MergeTree engines partitioned by `toYYYYMM(trade_date)`.
@@ -140,6 +145,22 @@ Data source: **Interactive Brokers** via `ib_insync`. Requires IB Gateway runnin
 | `bar.close` | `adj_close` | Same value |
 | `bar.volume` | `volume` | `int(bar.volume)` |
 
+### IB BarData → Futures Bronze mapping
+
+| IB BarData field | Bronze column | Transform |
+|---|---|---|
+| `bar.date` | `trade_date` | `str(bar.date)` |
+| (from composite ticker) | `contract_id` | Stable hash of composite ticker (e.g. `ES_202506`) |
+| (from composite ticker) | `root_symbol` | Parsed from `ticker.rsplit("_", 1)[0]` |
+| (from composite ticker) | `expiry_date` | `YYYY-MM-01` derived from expiry code |
+| `bar.open` | `open` | Already float |
+| `bar.high` | `high` | Already float |
+| `bar.low` | `low` | Already float |
+| `bar.close` | `close` | Already float |
+| `bar.close` | `settlement` | Same value (IB doesn't provide settlement) |
+| `bar.volume` | `volume` | `int(bar.volume)` |
+| (default) | `open_interest` | `0` (IB BarData doesn't include OI) |
+
 ### Running the pipeline
 
 ```bash
@@ -150,6 +171,8 @@ python scripts/fetch_ib_historical.py --preset presets/sp500.json      # From pr
 python scripts/fetch_ib_historical.py --years 0 --skip-existing        # Inception, skip existing
 python scripts/fetch_ib_historical.py --preset presets/sp500.json --backfill  # Backfill older data
 python scripts/fetch_ib_historical.py --preset presets/volatility.json --asset-class volatility  # CBOE vol indices
+python scripts/fetch_ib_historical.py --preset presets/futures-index.json --asset-class futures  # CME/CBOT index futures
+python scripts/fetch_ib_historical.py --preset presets/futures-energy.json --asset-class futures  # NYMEX energy futures
 ```
 
 Current fetch behavior:
@@ -158,6 +181,7 @@ Current fetch behavior:
 - The live service path does not open `market.duckdb`
 - If IB returns an empty head timestamp, the fetcher falls back to `IB_EARLIEST_DATE` instead of skipping the symbol
 - `--asset-class volatility` uses `Index('SYMBOL', 'CBOE')` contracts instead of `Stock('SYMBOL', 'SMART')` and writes to `data-lake/bronze/asset_class=volatility/`
+- `--asset-class futures` uses `Future(root, expiry, exchange)` contracts with composite tickers (`ES_202506`), writes to `data-lake/bronze/asset_class=futures/`, and uses the futures parquet schema (contract_id, root_symbol, expiry_date, settlement, open_interest)
 
 ### Backfill mode
 
@@ -174,7 +198,22 @@ Current fetch behavior:
 bash scripts/run_backfill_all.sh   # Runs all presets with stall detection + auto-restart
 ```
 
-Output: per-ticker bronze Parquet at `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet`. DuckDB is rebuilt separately when needed.
+Output: per-ticker bronze Parquet at `data-lake/bronze/asset_class=equity/symbol=<ticker>/data.parquet` (or `asset_class=futures/symbol=ES_202506/data.parquet` for futures). DuckDB is rebuilt separately when needed.
+
+### Futures preset format
+
+Futures presets use a `contracts` array instead of `tickers`:
+```json
+{
+  "name": "futures-index",
+  "asset_class": "futures",
+  "contracts": [
+    {"root": "ES", "exchange": "CME", "expiry": "202506"},
+    {"root": "NQ", "exchange": "CME", "expiry": "202506"}
+  ]
+}
+```
+`load_preset()` flattens these into composite tickers (`ES_202506`) and returns an exchange map for contract construction.
 
 Delisted symbols that should no longer participate in future syncs or backfills should be archived outside the canonical sync path under `data-lake/bronze-delisted/asset_class=equity/symbol=<ticker>/data.parquet`.
 
@@ -192,6 +231,7 @@ python scripts/daily_update.py --preset presets/sp500.json      # Limit to prese
 python scripts/daily_update.py --port 7497 --max-concurrent 4   # Custom IB config
 python scripts/daily_update.py --batch-size 25                  # Custom batch size
 python scripts/daily_update.py --asset-class volatility          # Daily update for volatility indices
+python scripts/daily_update.py --asset-class futures             # Daily update for futures contracts
 ```
 
 **Scheduling with launchd** (macOS):
@@ -202,7 +242,7 @@ sed "s|/path/to/repo|$(pwd)|g" scripts/com.market-warehouse.daily-update-watchdo
 launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update.plist
 launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update-watchdog.plist
 ```
-`scripts/run_daily_update.sh` now loads `.env` files, activates the warehouse venv, and runs `scripts/run_daily_update_job.py`, which retries failed sync attempts before terminal failure. The runner automatically syncs all asset classes (equity, then volatility) in a single invocation; pass `--asset-class <name>` to run only one.
+`scripts/run_daily_update.sh` now loads `.env` files, activates the warehouse venv, and runs `scripts/run_daily_update_job.py`, which retries failed sync attempts before terminal failure. The runner automatically syncs all asset classes (equity, volatility, then futures) in a single invocation; pass `--asset-class <name>` to run only one.
 
 The main sync runs at 13:05 Pacific local time daily (4:05 PM Eastern year-round). The watchdog runs at 18:30 Pacific by default and alerts if the scheduled sync never started or never logged a completion marker. Non-trading days are harmless no-ops.
 
@@ -213,7 +253,7 @@ The main sync runs at 13:05 Pacific local time daily (4:05 PM Eastern year-round
 - Bar validation: checks OHLCV relationships, positive prices, valid trading days, duplicate dates
 - Atomically rewrites a per-ticker bronze snapshot after each successful merge
 - The active sync universe is the canonical bronze tree only; archive delisted symbols outside that tree if they should stop participating in future syncs/backfills
-- Recovery path for unresolved target-day gaps (equity only): Nasdaq historical quote API (`stocks`, then `etf`) and then Stooq `symbol.us`; fallback is skipped for non-equity asset classes
+- Recovery path for unresolved target-day gaps (equity only): Nasdaq historical quote API (`stocks`, then `etf`) and then Stooq `symbol.us`; fallback is skipped for non-equity asset classes (volatility, futures)
 - Fallback bars use the same validation and bronze merge path as IB bars
 - Run summary exposes `Fallback attempts`, `Fallback successes`, and `Fallback symbols`
 - Pure-Python NYSE trading calendar — no new dependencies
@@ -228,9 +268,10 @@ The main sync runs at 13:05 Pacific local time daily (4:05 PM Eastern year-round
 source ~/market-warehouse/.venv/bin/activate
 python scripts/rebuild_duckdb_from_parquet.py                           # Rebuild equity data (default)
 python scripts/rebuild_duckdb_from_parquet.py --asset-class volatility  # Rebuild volatility data
+python scripts/rebuild_duckdb_from_parquet.py --asset-class futures     # Rebuild futures data
 ```
 
-This repopulates `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree when you want a fresh analytical DB file. The rebuild path recreates the analytical tables from scratch on each run, so rerunning it against an existing DuckDB file is safe. The `--asset-class` flag derives the correct bronze directory and sets the `venue` in `md.symbols` (`SMART` for equity, `CBOE` for volatility).
+This repopulates `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree when you want a fresh analytical DB file. The rebuild path recreates the analytical tables from scratch on each run, so rerunning it against an existing DuckDB file is safe. The `--asset-class` flag derives the correct bronze directory and sets the `venue` in `md.symbols` (`SMART` for equity, `CBOE` for volatility). Futures use `replace_futures_from_parquet()` which populates `md.futures_daily` directly (no `md.symbols` entries).
 
 ### Querying
 
@@ -283,6 +324,7 @@ Catches: AWS keys, API key/secret/password assignments, private key headers, Git
 - `symbol_id` is now a stable 53-bit hash from `blake2b(symbol)` for new symbols
 - Live ingestion writes bronze parquet directly; DuckDB is rebuilt from bronze when needed
 - Empty IB head timestamps now fall back to the earliest supported IB historical date instead of skipping the symbol
-- Bronze Parquet uses per-ticker Hive-partitioned layout: `data-lake/bronze/asset_class=equity/symbol=AAPL/data.parquet`
+- Bronze Parquet uses per-ticker Hive-partitioned layout: `data-lake/bronze/asset_class=equity/symbol=AAPL/data.parquet` (futures: `asset_class=futures/symbol=ES_202506/data.parquet`)
 - Bronze publication is atomic at the file level: write temp parquet, validate it, then `os.replace()` into place
+- `BronzeClient` accepts `asset_class` constructor param (`"equity"`, `"volatility"`, or `"futures"`) to select the appropriate parquet schema. Default `"equity"` preserves all existing behavior.
 - `IBClient.connect()` auto-retries successive `clientId` values after IB error `326`, then records the actual connected ID

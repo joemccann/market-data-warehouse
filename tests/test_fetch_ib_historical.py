@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from ib_insync import Index, Stock
+from ib_insync import Future, Index, Stock
 
 from clients.bronze_client import BronzeClient
 from scripts.fetch_ib_historical import (
@@ -24,6 +24,7 @@ from scripts.fetch_ib_historical import (
     _run_backfill,
     _run_normal,
     backfill_ticker,
+    bars_to_futures_rows,
     bars_to_rows,
     clear_cursor,
     compute_date_windows,
@@ -90,6 +91,41 @@ class TestBarsToRows:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# bars_to_futures_rows
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestBarsToFuturesRows:
+    def test_converts_bars_to_futures_row_dicts(self):
+        bar = _make_bar(
+            date="2025-01-02",
+            open=4500.0,
+            high=4550.0,
+            low=4480.0,
+            close=4520.0,
+            volume=500000,
+        )
+        rows = bars_to_futures_rows([bar], contract_id=12345, root_symbol="ES", expiry_date="2025-06-01")
+        assert len(rows) == 1
+        assert rows[0] == {
+            "trade_date": "2025-01-02",
+            "contract_id": 12345,
+            "root_symbol": "ES",
+            "expiry_date": "2025-06-01",
+            "open": 4500.0,
+            "high": 4550.0,
+            "low": 4480.0,
+            "close": 4520.0,
+            "settlement": 4520.0,
+            "volume": 500000,
+            "open_interest": 0,
+        }
+
+    def test_empty_bars(self):
+        assert bars_to_futures_rows([], contract_id=1, root_symbol="ES", expiry_date="2025-06-01") == []
+
+
+# ══════════════════════════════════════════════════════════════════════
 # compute_date_windows
 # ══════════════════════════════════════════════════════════════════════
 
@@ -149,18 +185,37 @@ class TestLoadPreset:
         preset_file = tmp_path / "test.json"
         preset_file.write_text(json.dumps(preset))
 
-        name, tickers = load_preset(preset_file)
+        name, tickers, exchange_map = load_preset(preset_file)
         assert name == "test-preset"
         assert tickers == ["AAPL", "MSFT", "NVDA"]
+        assert exchange_map == {}
 
     def test_loads_preset_from_string_path(self, tmp_path):
         preset = {"name": "sp500", "tickers": ["AAPL"]}
         preset_file = tmp_path / "sp500.json"
         preset_file.write_text(json.dumps(preset))
 
-        name, tickers = load_preset(str(preset_file))
+        name, tickers, exchange_map = load_preset(str(preset_file))
         assert name == "sp500"
         assert tickers == ["AAPL"]
+        assert exchange_map == {}
+
+    def test_loads_futures_preset_with_contracts(self, tmp_path):
+        preset = {
+            "name": "futures-index",
+            "asset_class": "futures",
+            "contracts": [
+                {"root": "ES", "exchange": "CME", "expiry": "202506"},
+                {"root": "NQ", "exchange": "CME", "expiry": "202506"},
+            ],
+        }
+        preset_file = tmp_path / "futures.json"
+        preset_file.write_text(json.dumps(preset))
+
+        name, tickers, exchange_map = load_preset(preset_file)
+        assert name == "futures-index"
+        assert tickers == ["ES_202506", "NQ_202506"]
+        assert exchange_map == {"ES_202506": "CME", "NQ_202506": "CME"}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -259,6 +314,29 @@ class TestMakeContract:
     def test_default_is_equity(self):
         contract = _make_contract("AAPL")
         assert isinstance(contract, Stock)
+
+    def test_make_contract_futures(self):
+        # ES maps to CME via ROOT_EXCHANGE_MAP
+        contract = _make_contract("ES_202506", "futures")
+        assert isinstance(contract, Future)
+        assert contract.symbol == "ES"
+        assert contract.lastTradeDateOrContractMonth == "202506"
+        assert contract.exchange == "CME"
+
+        # ZB maps to CBOT via ROOT_EXCHANGE_MAP
+        contract_zb = _make_contract("ZB_202506", "futures")
+        assert isinstance(contract_zb, Future)
+        assert contract_zb.exchange == "CBOT"
+
+        # Unknown root defaults to CME
+        contract_xx = _make_contract("XX_202506", "futures")
+        assert isinstance(contract_xx, Future)
+        assert contract_xx.exchange == "CME"
+
+        # Explicit exchange overrides the map
+        contract_explicit = _make_contract("ES_202506", "futures", exchange="GLOBEX")
+        assert isinstance(contract_explicit, Future)
+        assert contract_explicit.exchange == "GLOBEX"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -538,6 +616,17 @@ class TestFetchTicker:
         assert len(rows) == 1
         assert rows[0]["trade_date"] == "2025-01-02"
 
+    @pytest.mark.integration
+    def test_fetch_ticker_futures(self, tmp_bronze):
+        """fetch_ticker with asset_class='futures' converts bars via bars_to_futures_rows."""
+        bars = [
+            _make_bar(date="2025-01-02", open=4500.0, high=4550.0, low=4480.0, close=4520.0, volume=500000),
+        ]
+
+        with BronzeClient(bronze_dir=tmp_bronze, asset_class="futures") as futures_bronze:
+            inserted = fetch_ticker("ES_202506", bars, futures_bronze, asset_class="futures")
+        assert inserted > 0
+
 
 # ══════════════════════════════════════════════════════════════════════
 # export_bronze_parquet
@@ -629,6 +718,32 @@ class TestBackfillTicker:
     def test_empty_bars_returns_zero(self, bronze):
         inserted = backfill_ticker("XYZ", [], bronze)
         assert inserted == 0
+
+    @pytest.mark.integration
+    def test_backfill_ticker_futures(self, tmp_bronze):
+        """backfill_ticker with asset_class='futures' merges bars via bars_to_futures_rows."""
+        with BronzeClient(bronze_dir=tmp_bronze, asset_class="futures") as futures_bronze:
+            # Seed existing data
+            seed_id = futures_bronze.get_symbol_id("ES_202506")
+            futures_bronze.replace_ticker_rows(
+                "ES_202506",
+                [
+                    {
+                        "trade_date": "2025-01-02",
+                        "contract_id": seed_id,
+                        "root_symbol": "ES",
+                        "expiry_date": "2025-06-01",
+                        "open": 4500.0, "high": 4550.0, "low": 4480.0,
+                        "close": 4520.0, "settlement": 4520.0,
+                        "volume": 500000, "open_interest": 0,
+                    }
+                ]
+            )
+
+            # Backfill older bar
+            bars = [_make_bar(date="2024-12-15", open=4400.0, high=4450.0, low=4380.0, close=4420.0, volume=300000)]
+            inserted = backfill_ticker("ES_202506", bars, futures_bronze, asset_class="futures")
+        assert inserted == 1
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -20,7 +20,7 @@ DATA_LAKE = Path.home() / "market-warehouse" / "data-lake"
 DEFAULT_BRONZE_DIR = DATA_LAKE / "bronze" / "asset_class=equity"
 DEFAULT_DB_PATH = Path.home() / "market-warehouse" / "duckdb" / "market.duckdb"
 
-VENUE_MAP = {"equity": "SMART", "volatility": "CBOE"}
+VENUE_MAP = {"equity": "SMART", "volatility": "CBOE", "futures": "CME"}
 
 console = Console()
 
@@ -41,7 +41,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--asset-class",
-        choices=["equity", "volatility"],
+        choices=["equity", "volatility", "futures"],
         default="equity",
         help="Asset class to rebuild (default: equity)",
     )
@@ -65,14 +65,20 @@ def main() -> None:
     venue = VENUE_MAP[args.asset_class]
 
     with DBClient(db_path=args.db_path) as db:
-        counts = db.replace_equities_from_parquet(
-            args.bronze_dir, asset_class=args.asset_class, venue=venue,
-        )
-
-    console.print(
-        f"[green]Rebuilt[/green] {args.db_path} from {args.bronze_dir}"
-        f" with {counts['symbols']:,} symbols and {counts['rows']:,} rows"
-    )
+        if args.asset_class == "futures":
+            counts = db.replace_futures_from_parquet(args.bronze_dir)
+            console.print(
+                f"[green]Rebuilt[/green] {args.db_path} from {args.bronze_dir}"
+                f" with {counts['rows']:,} futures rows"
+            )
+        else:
+            counts = db.replace_equities_from_parquet(
+                args.bronze_dir, asset_class=args.asset_class, venue=venue,
+            )
+            console.print(
+                f"[green]Rebuilt[/green] {args.db_path} from {args.bronze_dir}"
+                f" with {counts['symbols']:,} symbols and {counts['rows']:,} rows"
+            )
 
 
 if __name__ == "__main__":

@@ -65,6 +65,27 @@ class DBClient:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_equities_daily_dedup "
             "ON md.equities_daily (trade_date, symbol_id)"
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS md.futures_daily (
+                trade_date DATE,
+                contract_id BIGINT,
+                root_symbol VARCHAR,
+                expiry_date DATE,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                settlement DOUBLE,
+                volume BIGINT,
+                open_interest BIGINT
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_futures_daily_dedup "
+            "ON md.futures_daily (trade_date, contract_id)"
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -361,3 +382,38 @@ class DBClient:
             """
         ).fetchone()
         return {"symbols": counts[0], "rows": counts[1]}
+
+    def replace_futures_from_parquet(
+        self,
+        bronze_dir: str | Path,
+    ) -> dict[str, int]:
+        """Rebuild md.futures_daily from bronze futures parquet."""
+        bronze_dir = Path(bronze_dir)
+        parquet_files = list(bronze_dir.glob("symbol=*/data.parquet"))
+        parquet_glob = str(bronze_dir / "symbol=*/data.parquet").replace("'", "''")
+
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute("DROP TABLE IF EXISTS md.futures_daily")
+            self._ensure_schema()
+            if parquet_files:
+                self._conn.execute(
+                    f"""
+                    INSERT INTO md.futures_daily
+                        (trade_date, contract_id, root_symbol, expiry_date,
+                         open, high, low, close, settlement, volume, open_interest)
+                    SELECT
+                        trade_date, contract_id, root_symbol, expiry_date,
+                        open, high, low, close, settlement, volume, open_interest
+                    FROM read_parquet('{parquet_glob}', hive_partitioning=true)
+                    """
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+        counts = self._conn.execute(
+            "SELECT count(*) FROM md.futures_daily"
+        ).fetchone()
+        return {"rows": counts[0]}

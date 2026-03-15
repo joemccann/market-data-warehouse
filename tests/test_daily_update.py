@@ -13,13 +13,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ib_insync import Index, Stock
+from ib_insync import Future, Index, Stock
 
 from clients.bronze_client import BronzeClient
 from scripts.daily_update import (
+    ROOT_EXCHANGE_MAP,
     _easter,
     _fallback_client,
     _make_contract,
+    bars_to_futures_rows,
     bars_to_rows,
     classify_gaps,
     compute_ib_duration,
@@ -392,6 +394,18 @@ class TestValidateBars:
         assert valid == []
         assert issues == []
 
+    def test_futures_skips_trading_day_check(self):
+        """A bar on a Saturday is invalid for equity but valid for futures."""
+        # 2025-01-04 is a Saturday
+        bar = _make_bar(date="2025-01-04")
+        valid_eq, issues_eq = validate_bars([bar], "ES_202506", asset_class="equity")
+        assert len(valid_eq) == 0
+        assert "not a trading day" in issues_eq[0]
+
+        valid_fut, issues_fut = validate_bars([bar], "ES_202506", asset_class="futures")
+        assert len(valid_fut) == 1
+        assert issues_fut == []
+
 
 # ══════════════════════════════════════════════════════════════════════
 # bars_to_rows
@@ -407,6 +421,25 @@ class TestBarsToRows:
 
     def test_empty_bars(self):
         assert bars_to_rows([], symbol_id=1) == []
+
+
+class TestBarsToFuturesRows:
+    def test_converts_single_bar(self):
+        bar = _make_bar(date="2025-01-02", open=5100.0, high=5150.0, low=5050.0, close=5120.0, volume=50000)
+        rows = bars_to_futures_rows([bar], contract_id=99, root_symbol="ES", expiry_date="2025-06-01")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["trade_date"] == "2025-01-02"
+        assert row["contract_id"] == 99
+        assert row["root_symbol"] == "ES"
+        assert row["expiry_date"] == "2025-06-01"
+        assert row["open"] == 5100.0
+        assert row["high"] == 5150.0
+        assert row["low"] == 5050.0
+        assert row["close"] == 5120.0
+        assert row["settlement"] == 5120.0  # settlement == close
+        assert row["volume"] == 50000
+        assert row["open_interest"] == 0
 
 
 class TestGetMissingTradingDates:
@@ -473,6 +506,18 @@ class TestMakeContract:
         contract = _make_contract("AAPL")
         assert isinstance(contract, Stock)
 
+    def test_futures_returns_future(self):
+        contract = _make_contract("ES_202506", "futures")
+        assert isinstance(contract, Future)
+        assert contract.symbol == "ES"
+        assert contract.lastTradeDateOrContractMonth == "202506"
+        assert contract.exchange == "CME"
+
+    def test_futures_cbot_exchange(self):
+        contract = _make_contract("ZB_202506", "futures")
+        assert isinstance(contract, Future)
+        assert contract.exchange == "CBOT"
+
 
 # ══════════════════════════════════════════════════════════════════════
 # load_preset
@@ -487,6 +532,20 @@ class TestLoadPreset:
         name, tickers = load_preset(preset_file)
         assert name == "test-preset"
         assert tickers == ["AAPL", "MSFT"]
+
+    def test_loads_futures_preset_with_contracts(self, tmp_path):
+        preset = {
+            "name": "futures-test",
+            "contracts": [
+                {"root": "ES", "expiry": "202506"},
+                {"root": "NQ", "expiry": "202509"},
+            ],
+        }
+        preset_file = tmp_path / "futures.json"
+        preset_file.write_text(json.dumps(preset))
+        name, tickers = load_preset(preset_file)
+        assert name == "futures-test"
+        assert tickers == ["ES_202506", "NQ_202509"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1393,4 +1452,80 @@ class TestMain:
         assert [row["trade_date"] for row in rows] == ["2025-01-02", "2025-01-03"]
 
         # Fallback should never have been called
+        mock_fallback.get_daily_bar.assert_not_called()
+
+    @pytest.mark.integration
+    def test_asset_class_futures_end_to_end(self, tmp_path, monkeypatch):
+        """main() with --asset-class futures uses bars_to_futures_rows and skips fallback."""
+        monkeypatch.setattr(
+            "sys.argv",
+            ["daily_update.py", "--asset-class", "futures", "--force"],
+        )
+
+        fut_bronze_dir = tmp_path / "data-lake" / "bronze" / "asset_class=futures"
+        # Seed bronze with futures-schema rows
+        with BronzeClient(bronze_dir=fut_bronze_dir, asset_class="futures") as bronze:
+            bronze.replace_ticker_rows(
+                "ES_202506",
+                [
+                    {
+                        "trade_date": "2025-01-02",
+                        "contract_id": 99,
+                        "root_symbol": "ES",
+                        "expiry_date": "2025-06-01",
+                        "open": 5100.0,
+                        "high": 5150.0,
+                        "low": 5050.0,
+                        "close": 5120.0,
+                        "settlement": 5120.0,
+                        "volume": 50000,
+                        "open_interest": 0,
+                    }
+                ],
+            )
+
+        today = date(2025, 1, 3)
+        mock_ib = _mock_ib_instance(
+            {
+                "ES_202506": [
+                    _make_bar(
+                        date="2025-01-03",
+                        open=5130.0,
+                        high=5180.0,
+                        low=5100.0,
+                        close=5160.0,
+                        volume=60000,
+                    )
+                ]
+            }
+        )
+        mock_fallback = _mock_fallback_instance()
+
+        with (
+            patch("scripts.daily_update.is_trading_day", return_value=True),
+            patch("scripts.daily_update.date") as mock_date,
+            patch("scripts.daily_update.IBClient", return_value=mock_ib),
+            patch("scripts.daily_update.FallbackClient", return_value=mock_fallback),
+            patch(
+                "scripts.daily_update.BronzeClient",
+                lambda **kw: BronzeClient(
+                    bronze_dir=kw.get("bronze_dir", fut_bronze_dir),
+                    asset_class=kw.get("asset_class", "futures"),
+                ),
+            ),
+            patch("scripts.daily_update.DATA_LAKE", tmp_path / "data-lake"),
+        ):
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            mock_date.side_effect = lambda *a, **kw: date(*a, **kw)
+            main()
+
+        with BronzeClient(bronze_dir=fut_bronze_dir, asset_class="futures") as bronze:
+            rows = bronze.read_symbol_rows("ES_202506")
+        assert len(rows) == 2
+        assert [row["trade_date"] for row in rows] == ["2025-01-02", "2025-01-03"]
+        assert rows[1]["root_symbol"] == "ES"
+        assert rows[1]["close"] == 5160.0
+
+        # Fallback should never have been called (futures skips fallback)
         mock_fallback.get_daily_bar.assert_not_called()

@@ -45,7 +45,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from ib_insync import Index, Stock
+from ib_insync import Future, Index, Stock
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -86,8 +86,20 @@ IB_EARLIEST_DATE = datetime(1993, 1, 29)
 console = Console()
 
 
-def _make_contract(ticker: str, asset_class: str = "equity"):
+ROOT_EXCHANGE_MAP = {
+    "ES": "CME", "NQ": "CME", "RTY": "CME",
+    "YM": "CBOT", "ZB": "CBOT", "ZN": "CBOT", "ZF": "CBOT",
+    "CL": "NYMEX", "NG": "NYMEX",
+    "GC": "COMEX", "SI": "COMEX",
+}
+
+
+def _make_contract(ticker: str, asset_class: str = "equity", exchange: str | None = None):
     """Build an IB contract for the given *ticker* and *asset_class*."""
+    if asset_class == "futures":
+        root, expiry = ticker.rsplit("_", 1)
+        exch = exchange or ROOT_EXCHANGE_MAP.get(root, "CME")
+        return Future(root, expiry, exch, "USD")
     if asset_class == "volatility":
         return Index(ticker, "CBOE", "USD")
     return Stock(ticker, "SMART", "USD")
@@ -96,12 +108,28 @@ def _make_contract(ticker: str, asset_class: str = "equity"):
 # ── Preset & cursor helpers ───────────────────────────────────────────
 
 
-def load_preset(path: str | Path) -> tuple[str, list[str]]:
-    """Read a preset JSON file and return ``(name, tickers)``."""
+def load_preset(path: str | Path) -> tuple[str, list[str], dict[str, str]]:
+    """Read a preset JSON file and return ``(name, tickers, exchange_map)``.
+
+    Standard presets use a ``tickers`` array.  Futures presets use a
+    ``contracts`` array of ``{root, exchange, expiry}`` dicts which are
+    flattened into composite ticker strings (``ES_202506``) and an exchange
+    map so ``_make_contract`` can resolve the correct venue.
+    """
     p = Path(path)
     with p.open() as f:
         data = json.load(f)
-    return (data["name"], data["tickers"])
+
+    exchange_map: dict[str, str] = {}
+    if "contracts" in data:
+        tickers: list[str] = []
+        for contract in data["contracts"]:
+            composite = f"{contract['root']}_{contract['expiry']}"
+            tickers.append(composite)
+            exchange_map[composite] = contract.get("exchange", "CME")
+        return (data["name"], tickers, exchange_map)
+
+    return (data["name"], data["tickers"], exchange_map)
 
 
 def _cursor_path(name: str) -> Path:
@@ -201,6 +229,34 @@ def bars_to_rows(bars: list, symbol_id: int) -> list[dict]:
     return rows
 
 
+def bars_to_futures_rows(
+    bars: list, contract_id: int, root_symbol: str, expiry_date: str,
+) -> list[dict]:
+    """Convert IB BarData objects to md.futures_daily row dicts.
+
+    settlement defaults to close; open_interest defaults to 0 (IB BarData
+    does not include these fields for daily bars).
+    """
+    rows = []
+    for bar in bars:
+        rows.append(
+            {
+                "trade_date": str(bar.date),
+                "contract_id": contract_id,
+                "root_symbol": root_symbol,
+                "expiry_date": expiry_date,
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "settlement": float(bar.close),
+                "volume": int(bar.volume),
+                "open_interest": 0,
+            }
+        )
+    return rows
+
+
 # ── Async fetching ────────────────────────────────────────────────────
 
 
@@ -209,6 +265,7 @@ async def fetch_ticker_bars(
     max_years: int = 0,
     end_dt_override: datetime | None = None,
     asset_class: str = "equity",
+    exchange: str | None = None,
 ) -> tuple[str, list]:
     """Fetch historical daily bars for *ticker*.
 
@@ -217,7 +274,7 @@ async def fetch_ticker_bars(
     Returns ``(ticker, bars)`` where bars are deduplicated IB BarData objects.
     """
     t0 = time.monotonic()
-    contract = _make_contract(ticker, asset_class)
+    contract = _make_contract(ticker, asset_class, exchange=exchange)
     await ib.ib.qualifyContractsAsync(contract)
 
     head_ts = await ib.get_head_timestamp_async(contract)
@@ -289,6 +346,7 @@ async def fetch_all_tickers(
     max_years: int = 0,
     end_dt_overrides: dict[str, datetime] | None = None,
     asset_class: str = "equity",
+    exchange_map: dict[str, str] | None = None,
 ) -> dict[str, list]:
     """Fetch historical bars for all *tickers* concurrently.
 
@@ -307,7 +365,8 @@ async def fetch_all_tickers(
     async def _safe_fetch(ticker: str) -> tuple[str, list]:
         try:
             edt = end_dt_overrides.get(ticker) if end_dt_overrides else None
-            return await fetch_ticker_bars(ticker, ib, semaphore, max_years=max_years, end_dt_override=edt, asset_class=asset_class)
+            exch = (exchange_map or {}).get(ticker)
+            return await fetch_ticker_bars(ticker, ib, semaphore, max_years=max_years, end_dt_override=edt, asset_class=asset_class, exchange=exch)
         except (IBError, Exception) as exc:
             console.print(f"    [red]{ticker}: {type(exc).__name__} — {exc}[/red]")
             return (ticker, [])
@@ -332,6 +391,7 @@ def fetch_ticker(
     ticker: str,
     bars: list,
     bronze: BronzeClient,
+    asset_class: str = "equity",
 ) -> int:
     """Persist pre-fetched bars for *ticker* into bronze parquet."""
     if not bars:
@@ -339,7 +399,12 @@ def fetch_ticker(
         return 0
 
     symbol_id = bronze.get_symbol_id(ticker)
-    rows = bars_to_rows(bars, symbol_id)
+    if asset_class == "futures":
+        root, expiry = ticker.rsplit("_", 1)
+        expiry_date = f"{expiry[:4]}-{expiry[4:6]}-01"
+        rows = bars_to_futures_rows(bars, symbol_id, root, expiry_date)
+    else:
+        rows = bars_to_rows(bars, symbol_id)
     inserted = bronze.replace_ticker_rows(ticker, rows)
     if hasattr(bronze, "write_ticker_parquet"):
         bronze.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
@@ -359,14 +424,19 @@ def get_oldest_dates(bronze: BronzeClient) -> dict[str, str]:
     return bronze.get_oldest_dates()
 
 
-def backfill_ticker(ticker: str, bars: list, bronze: BronzeClient) -> int:
+def backfill_ticker(ticker: str, bars: list, bronze: BronzeClient, asset_class: str = "equity") -> int:
     """Insert backfill bars for *ticker* without deleting existing data."""
     if not bars:
         console.print(f"  [yellow]No backfill data for {ticker}[/yellow]")
         return 0
 
     symbol_id = bronze.get_symbol_id(ticker)
-    rows = bars_to_rows(bars, symbol_id)
+    if asset_class == "futures":
+        root, expiry = ticker.rsplit("_", 1)
+        expiry_date = f"{expiry[:4]}-{expiry[4:6]}-01"
+        rows = bars_to_futures_rows(bars, symbol_id, root, expiry_date)
+    else:
+        rows = bars_to_rows(bars, symbol_id)
     inserted = bronze.merge_ticker_rows(ticker, rows)
     if hasattr(bronze, "write_ticker_parquet"):
         bronze.write_ticker_parquet(ticker, symbol_id, BRONZE_DIR)
@@ -432,9 +502,9 @@ def main():
     )
     parser.add_argument(
         "--asset-class",
-        choices=["equity", "volatility"],
+        choices=["equity", "volatility", "futures"],
         default="equity",
-        help="Asset class to fetch (default: equity). Use 'volatility' for CBOE volatility indices.",
+        help="Asset class to fetch (default: equity).",
     )
     args = parser.parse_args()
 
@@ -445,8 +515,9 @@ def main():
     )
 
     # ── Resolve tickers and cursor name ──────────────────────────────
+    exchange_map: dict[str, str] = {}
     if args.preset:
-        cursor_name, all_tickers = load_preset(args.preset)
+        cursor_name, all_tickers, exchange_map = load_preset(args.preset)
         console.print(f"\n[bold]Preset:[/bold] {cursor_name} ({len(all_tickers)} tickers)")
     else:
         cursor_name = "custom"
@@ -494,17 +565,17 @@ def main():
     asset_class = args.asset_class
     bronze_dir = DATA_LAKE / "bronze" / f"asset_class={asset_class}"
 
-    with IBClient() as ib, _storage_client()(bronze_dir=bronze_dir) as bronze:
+    with IBClient() as ib, _storage_client()(bronze_dir=bronze_dir, asset_class=asset_class) as bronze:
         ib.connect(port=args.port)
 
         if args.backfill:
             _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
                           effective_cursor, started_at, asset_class=asset_class,
-                          bronze_dir=bronze_dir)
+                          bronze_dir=bronze_dir, exchange_map=exchange_map)
         else:
             _run_normal(args, ib, bronze, all_tickers, remaining, completed,
                         effective_cursor, started_at, asset_class=asset_class,
-                        bronze_dir=bronze_dir)
+                        bronze_dir=bronze_dir, exchange_map=exchange_map)
 
         run_elapsed = time.monotonic() - run_t0
         console.print(f"\n{'═' * 60}")
@@ -524,7 +595,8 @@ def main():
 
 
 def _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
-                  cursor_name, started_at, *, asset_class="equity", bronze_dir=None):
+                  cursor_name, started_at, *, asset_class="equity", bronze_dir=None,
+                  exchange_map=None):
     """Backfill mode: fetch only missing older data for tickers already in bronze."""
     oldest_dates = get_oldest_dates(bronze)
 
@@ -569,7 +641,8 @@ def _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
         ticker_bars = ib.ib.run(
             fetch_all_tickers(batch, ib, max_concurrent=args.max_concurrent,
                               end_dt_overrides=batch_overrides,
-                              asset_class=asset_class)
+                              asset_class=asset_class,
+                              exchange_map=exchange_map)
         )
 
         batch_rows = 0
@@ -588,7 +661,7 @@ def _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
             for ticker in batch:
                 progress.update(task, description=f"Backfilling {ticker}...")
                 bars = ticker_bars.get(ticker, [])
-                count = backfill_ticker(ticker, bars, bronze)
+                count = backfill_ticker(ticker, bars, bronze, asset_class=asset_class)
 
                 if count > 0:
                     completed.add(ticker)
@@ -621,7 +694,8 @@ def _run_backfill(args, ib, bronze, all_tickers, remaining, completed,
 
 
 def _run_normal(args, ib, bronze, all_tickers, remaining, completed,
-                cursor_name, started_at, *, asset_class="equity", bronze_dir=None):
+                cursor_name, started_at, *, asset_class="equity", bronze_dir=None,
+                exchange_map=None):
     """Normal fetch mode: replace the per-ticker bronze snapshot."""
     if args.skip_existing:
         existing = get_existing_symbols(bronze)
@@ -658,7 +732,8 @@ def _run_normal(args, ib, bronze, all_tickers, remaining, completed,
         )
 
         ticker_bars = ib.ib.run(
-            fetch_all_tickers(batch, ib, max_concurrent=args.max_concurrent, max_years=args.years, asset_class=asset_class)
+            fetch_all_tickers(batch, ib, max_concurrent=args.max_concurrent, max_years=args.years,
+                              asset_class=asset_class, exchange_map=exchange_map)
         )
 
         batch_rows = 0
@@ -677,7 +752,7 @@ def _run_normal(args, ib, bronze, all_tickers, remaining, completed,
             for ticker in batch:
                 progress.update(task, description=f"Inserting {ticker}...")
                 bars = ticker_bars.get(ticker, [])
-                count = fetch_ticker(ticker, bars, bronze)
+                count = fetch_ticker(ticker, bars, bronze, asset_class=asset_class)
 
                 if count > 0:
                     completed.add(ticker)

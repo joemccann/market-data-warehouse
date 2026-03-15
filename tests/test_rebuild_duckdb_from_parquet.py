@@ -192,3 +192,43 @@ class TestRebuildDuckDBFromParquet:
 
         with DBClient(db_path=db_path) as db:
             assert db.get_latest_dates() == {"AAPL": "2025-01-02"}
+
+    @pytest.mark.integration
+    def test_asset_class_futures(self, tmp_path, monkeypatch):
+        """--asset-class futures uses replace_futures_from_parquet."""
+        data_lake = tmp_path / "data-lake"
+        fut_bronze = data_lake / "bronze" / "asset_class=futures"
+        db_path = tmp_path / "rebuilt.duckdb"
+
+        from clients.bronze_client import BronzeClient
+        from clients.symbol_ids import stable_symbol_id
+        contract_id = stable_symbol_id("ES_202506")
+        with BronzeClient(bronze_dir=fut_bronze, asset_class="futures") as bronze:
+            bronze.replace_ticker_rows("ES_202506", [
+                {
+                    "trade_date": "2025-01-02",
+                    "contract_id": contract_id,
+                    "root_symbol": "ES",
+                    "expiry_date": "2025-06-01",
+                    "open": 4500.0, "high": 4550.0, "low": 4480.0,
+                    "close": 4520.0, "settlement": 4520.0,
+                    "volume": 500000, "open_interest": 0,
+                },
+            ])
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "rebuild_duckdb_from_parquet.py",
+                "--asset-class", "futures",
+                "--db-path", str(db_path),
+            ],
+        )
+
+        with patch("scripts.rebuild_duckdb_from_parquet.DATA_LAKE", data_lake):
+            main()
+
+        with DBClient(db_path=db_path) as db:
+            rows = db.query("SELECT * FROM md.futures_daily")
+            assert len(rows) == 1
+            assert rows[0]["root_symbol"] == "ES"

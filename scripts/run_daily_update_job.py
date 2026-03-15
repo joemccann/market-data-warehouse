@@ -17,7 +17,7 @@ from typing import Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-ASSET_CLASSES = ["equity", "volatility"]
+ASSET_CLASSES = ["equity", "volatility", "futures"]
 
 
 @dataclass(frozen=True)

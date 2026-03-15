@@ -38,7 +38,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ib_insync import Index, Stock
+from ib_insync import Future, Index, Stock
 from rich.console import Console
 from rich.logging import RichHandler
 
@@ -83,8 +83,20 @@ BRONZE_DIR = DATA_LAKE / "bronze" / "asset_class=equity"
 console = Console()
 
 
+ROOT_EXCHANGE_MAP = {
+    "ES": "CME", "NQ": "CME", "RTY": "CME",
+    "YM": "CBOT", "ZB": "CBOT", "ZN": "CBOT", "ZF": "CBOT",
+    "CL": "NYMEX", "NG": "NYMEX",
+    "GC": "COMEX", "SI": "COMEX",
+}
+
+
 def _make_contract(ticker: str, asset_class: str = "equity"):
     """Build an IB contract for the given *ticker* and *asset_class*."""
+    if asset_class == "futures":
+        root, expiry = ticker.rsplit("_", 1)
+        exch = ROOT_EXCHANGE_MAP.get(root, "CME")
+        return Future(root, expiry, exch, "USD")
     if asset_class == "volatility":
         return Index(ticker, "CBOE", "USD")
     return Stock(ticker, "SMART", "USD")
@@ -268,13 +280,13 @@ def get_missing_trading_dates(
 
 
 def validate_bars(
-    bars: list, ticker: str
+    bars: list, ticker: str, asset_class: str = "equity",
 ) -> tuple[list, list[str]]:
     """Validate bar data quality. Returns (valid_bars, issues).
 
     Checks: non-null OHLCV, high >= low, high >= open/close,
     low <= open/close, volume >= 0, positive open/close,
-    valid trading day, no duplicate dates.
+    valid trading day (skipped for futures), no duplicate dates.
     """
     valid: list = []
     issues: list[str] = []
@@ -312,13 +324,14 @@ def validate_bars(
             if bar.close <= 0:
                 problems.append(f"non-positive close ({bar.close})")
 
-            # Trading day check
-            try:
-                bar_d = date.fromisoformat(bar_date)
-                if not is_trading_day(bar_d):
-                    problems.append(f"{bar_date} is not a trading day")
-            except ValueError:
-                problems.append(f"invalid date format: {bar_date}")
+            # Trading day check (skipped for futures — nearly 24h sessions)
+            if asset_class != "futures":
+                try:
+                    bar_d = date.fromisoformat(bar_date)
+                    if not is_trading_day(bar_d):
+                        problems.append(f"{bar_date} is not a trading day")
+                except ValueError:
+                    problems.append(f"invalid date format: {bar_date}")
 
         if problems:
             issues.append(f"{ticker} {bar_date}: {'; '.join(problems)}")
@@ -345,6 +358,30 @@ def bars_to_rows(bars: list, symbol_id: int) -> list[dict]:
                 "close": float(bar.close),
                 "adj_close": float(bar.close),
                 "volume": int(bar.volume),
+            }
+        )
+    return rows
+
+
+def bars_to_futures_rows(
+    bars: list, contract_id: int, root_symbol: str, expiry_date: str,
+) -> list[dict]:
+    """Convert IB BarData objects to md.futures_daily row dicts."""
+    rows = []
+    for bar in bars:
+        rows.append(
+            {
+                "trade_date": str(bar.date),
+                "contract_id": contract_id,
+                "root_symbol": root_symbol,
+                "expiry_date": expiry_date,
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "settlement": float(bar.close),
+                "volume": int(bar.volume),
+                "open_interest": 0,
             }
         )
     return rows
@@ -425,10 +462,21 @@ async def fetch_batch(
 
 
 def load_preset(path: str | Path) -> tuple[str, list[str]]:
-    """Read a preset JSON file and return ``(name, tickers)``."""
+    """Read a preset JSON file and return ``(name, tickers)``.
+
+    Futures presets use a ``contracts`` array which is flattened into
+    composite ticker strings (``ES_202506``).
+    """
     p = Path(path)
     with p.open() as f:
         data = json.load(f)
+
+    if "contracts" in data:
+        tickers = [
+            f"{c['root']}_{c['expiry']}" for c in data["contracts"]
+        ]
+        return (data["name"], tickers)
+
     return (data["name"], data["tickers"])
 
 
@@ -487,9 +535,9 @@ def main():
     )
     parser.add_argument(
         "--asset-class",
-        choices=["equity", "volatility"],
+        choices=["equity", "volatility", "futures"],
         default="equity",
-        help="Asset class to update (default: equity). Use 'volatility' for CBOE volatility indices.",
+        help="Asset class to update (default: equity).",
     )
     args = parser.parse_args()
 
@@ -519,7 +567,7 @@ def main():
         console.print(f"[bold]Preset:[/bold] {preset_name} ({len(preset_tickers)} tickers)")
 
     # ── Gap detection ───────────────────────────────────────────────
-    with _storage_client()(bronze_dir=bronze_dir) as bronze:
+    with _storage_client()(bronze_dir=bronze_dir, asset_class=asset_class) as bronze:
         latest_dates = bronze.get_latest_dates()
 
         if not latest_dates:
@@ -594,7 +642,7 @@ def main():
 
                 for ticker, duration in batch:
                     bars = ticker_bars.get(ticker, [])
-                    valid_bars, issues = validate_bars(bars, ticker)
+                    valid_bars, issues = validate_bars(bars, ticker, asset_class=asset_class)
                     total_issues.extend(issues)
                     total_validated += len(bars)
 
@@ -606,7 +654,7 @@ def main():
                         if latest < date.fromisoformat(str(b.date)) <= target
                     ]
 
-                    # Fallback recovery (equity only — Nasdaq/Stooq don't cover indices)
+                    # Fallback recovery (equity only — Nasdaq/Stooq don't cover indices/futures)
                     if asset_class == "equity":
                         missing_dates = get_missing_trading_dates(latest, target, valid_bars)
                         fallback_attempts += len(missing_dates)
@@ -614,7 +662,7 @@ def main():
                             ticker, missing_dates, fallback,
                         )
                         if fallback_bars:
-                            recovered_bars, fallback_issues = validate_bars(fallback_bars, ticker)
+                            recovered_bars, fallback_issues = validate_bars(fallback_bars, ticker, asset_class=asset_class)
                             total_issues.extend(fallback_issues)
                             total_validated += len(fallback_bars)
                             if recovered_bars:
@@ -641,7 +689,12 @@ def main():
                         continue
 
                     symbol_id = bronze.get_symbol_id(ticker)
-                    rows = bars_to_rows(valid_bars, symbol_id)
+                    if asset_class == "futures":
+                        root, expiry = ticker.rsplit("_", 1)
+                        expiry_date = f"{expiry[:4]}-{expiry[4:6]}-01"
+                        rows = bars_to_futures_rows(valid_bars, symbol_id, root, expiry_date)
+                    else:
+                        rows = bars_to_rows(valid_bars, symbol_id)
                     inserted = bronze.merge_ticker_rows(ticker, rows)
                     if hasattr(bronze, "write_ticker_parquet"):
                         bronze.write_ticker_parquet(ticker, symbol_id, bronze_dir)

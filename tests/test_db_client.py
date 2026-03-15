@@ -552,3 +552,60 @@ class TestStorageCompatibility:
         symbols = db.query("SELECT * FROM md.symbols WHERE symbol = 'VIX'")
         assert symbols[0]["asset_class"] == "volatility"
         assert symbols[0]["venue"] == "CBOE"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# futures_daily
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestFuturesDaily:
+    @pytest.mark.integration
+    def test_ensure_schema_creates_futures_table(self, db):
+        indexes = db.query(
+            "SELECT index_name FROM duckdb_indexes() WHERE index_name = 'idx_futures_daily_dedup'"
+        )
+        assert len(indexes) == 1
+
+    @pytest.mark.integration
+    def test_replace_futures_from_parquet(self, db, tmp_path):
+        # Create futures bronze parquet via BronzeClient
+        futures_bronze = tmp_path / "futures-bronze"
+        from clients.bronze_client import BronzeClient
+        from clients.symbol_ids import stable_symbol_id
+        contract_id = stable_symbol_id("ES_202506")
+        with BronzeClient(bronze_dir=futures_bronze, asset_class="futures") as bronze:
+            bronze.replace_ticker_rows("ES_202506", [
+                {
+                    "trade_date": "2025-01-02",
+                    "contract_id": contract_id,
+                    "root_symbol": "ES",
+                    "expiry_date": "2025-06-01",
+                    "open": 4500.0, "high": 4550.0, "low": 4480.0,
+                    "close": 4520.0, "settlement": 4520.0,
+                    "volume": 500000, "open_interest": 0,
+                },
+            ])
+
+        counts = db.replace_futures_from_parquet(futures_bronze)
+        assert counts["rows"] == 1
+
+        rows = db.query("SELECT * FROM md.futures_daily")
+        assert len(rows) == 1
+        assert rows[0]["root_symbol"] == "ES"
+
+    @pytest.mark.integration
+    def test_replace_futures_from_parquet_empty(self, db, tmp_path):
+        empty_bronze = tmp_path / "empty-bronze"
+        empty_bronze.mkdir(parents=True)
+        counts = db.replace_futures_from_parquet(empty_bronze)
+        assert counts["rows"] == 0
+
+    @pytest.mark.integration
+    def test_replace_futures_from_parquet_rollback_on_error(self, db, tmp_path):
+        broken_bronze = tmp_path / "bronze" / "symbol=ES_202506"
+        broken_bronze.mkdir(parents=True, exist_ok=True)
+        (broken_bronze / "data.parquet").write_text("not parquet")
+
+        with pytest.raises(Exception):
+            db.replace_futures_from_parquet(tmp_path / "bronze")

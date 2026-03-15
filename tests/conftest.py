@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS md.equities_daily (
     adj_close DOUBLE,
     volume BIGINT
 );
+
+CREATE TABLE IF NOT EXISTS md.futures_daily (
+    trade_date DATE,
+    contract_id BIGINT,
+    root_symbol VARCHAR,
+    expiry_date DATE,
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
+    settlement DOUBLE,
+    volume BIGINT,
+    open_interest BIGINT
+);
 """
 
 

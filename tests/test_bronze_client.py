@@ -205,3 +205,86 @@ class TestBronzeClient:
         assert bronze._normalize_trade_date("2025-01-04") == date(2025, 1, 4)
         with pytest.raises(TypeError, match="unsupported trade_date type"):
             bronze._normalize_trade_date(123)
+
+
+# ── Futures-specific tests ────────────────────────────────────────────
+
+
+def _futures_row(trade_date: str, contract_id: int, close: float) -> dict:
+    return {
+        "trade_date": trade_date,
+        "contract_id": contract_id,
+        "root_symbol": "ES",
+        "expiry_date": "2025-06-01",
+        "open": close - 1.0,
+        "high": close + 1.0,
+        "low": close - 2.0,
+        "close": close,
+        "settlement": close,
+        "volume": 5000,
+        "open_interest": 0,
+    }
+
+
+class TestBronzeClientFutures:
+    @pytest.fixture()
+    def futures_bronze(self, tmp_bronze):
+        client = BronzeClient(bronze_dir=tmp_bronze, asset_class="futures")
+        yield client
+        client.close()
+
+    @pytest.mark.integration
+    def test_invalid_asset_class_raises(self, tmp_bronze):
+        with pytest.raises(ValueError, match="unsupported asset_class"):
+            BronzeClient(bronze_dir=tmp_bronze, asset_class="nope")
+
+    @pytest.mark.integration
+    def test_futures_replace_and_read(self, futures_bronze):
+        cid = futures_bronze.get_symbol_id("ESM5")
+        row = _futures_row("2025-03-10", cid, 5200.0)
+        assert futures_bronze.replace_ticker_rows("ESM5", [row]) == 1
+
+        rows = futures_bronze.read_symbol_rows("ESM5")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["trade_date"] == "2025-03-10"
+        assert r["contract_id"] == cid
+        assert r["root_symbol"] == "ES"
+        assert r["expiry_date"] == "2025-06-01"
+        assert r["open"] == 5199.0
+        assert r["high"] == 5201.0
+        assert r["low"] == 5198.0
+        assert r["close"] == 5200.0
+        assert r["settlement"] == 5200.0
+        assert r["volume"] == 5000
+        assert r["open_interest"] == 0
+
+    @pytest.mark.integration
+    def test_futures_merge_counts_new_dates(self, futures_bronze):
+        cid = futures_bronze.get_symbol_id("ESM5")
+        futures_bronze.replace_ticker_rows(
+            "ESM5", [_futures_row("2025-03-10", cid, 5200.0)]
+        )
+
+        inserted = futures_bronze.merge_ticker_rows(
+            "ESM5",
+            [
+                _futures_row("2025-03-10", cid, 5210.0),
+                _futures_row("2025-03-11", cid, 5220.0),
+            ],
+        )
+        assert inserted == 1
+
+        rows = futures_bronze.read_symbol_rows("ESM5")
+        assert len(rows) == 2
+        assert [r["trade_date"] for r in rows] == ["2025-03-10", "2025-03-11"]
+
+    @pytest.mark.integration
+    def test_futures_get_symbol_id_uses_contract_id(self, futures_bronze):
+        cid = stable_symbol_id("ESM5")
+        futures_bronze.replace_ticker_rows(
+            "ESM5", [_futures_row("2025-03-10", cid, 5200.0)]
+        )
+
+        retrieved = futures_bronze.get_symbol_id("ESM5")
+        assert retrieved == cid

@@ -1,0 +1,23 @@
+{
+  "name": "futures-energy",
+  "description": "NYMEX Energy Futures — CL, NG",
+  "asset_class": "futures",
+  "contracts": [
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202606"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202609"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202612"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202703"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202706"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202709"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202712"},
+    {"root": "CL", "exchange": "NYMEX", "expiry": "202803"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202606"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202609"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202612"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202703"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202706"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202709"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202712"},
+    {"root": "NG", "exchange": "NYMEX", "expiry": "202803"}
+  ]
+}

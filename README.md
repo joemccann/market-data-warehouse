@@ -6,7 +6,7 @@ A local-first financial data warehouse for universe-scale market data.
 
 The project is designed to store and analyze historical **OHLCV data across equities, options, and futures** with a path from **daily bars today to intraday data later**. It uses a **partitioned Parquet data lake** as the canonical storage layer, **DuckDB** as the fast local analytical engine for research and backtesting, and **ClickHouse** as the production-oriented warehouse for large-scale aggregation, serving, and concurrency.
 
-Today, the implemented ingestion path is Python-first and covers daily equities and CBOE volatility indices: Interactive Brokers data lands directly in per-ticker bronze snapshots under `data-lake/bronze/asset_class={equity|volatility}/symbol=<ticker>/data.parquet`, and DuckDB is rebuilt from parquet when you want a local analytical file. Delisted symbols that should no longer participate in future syncs can be archived out of the canonical sync path under `data-lake/bronze-delisted/asset_class=equity/symbol=<ticker>/data.parquet` while preserving their history. The broader staged-Parquet and multi-asset orchestration remains the target architecture, but the live service path no longer writes `market.duckdb`. For scheduled daily syncs, IB remains the primary source; the daily daemon automatically syncs all asset classes, and has a narrow external fallback chain for unresolved target-day gaps in the U.S. equity universe.
+Today, the implemented ingestion path is Python-first and covers daily equities, CBOE volatility indices, and futures: Interactive Brokers data lands directly in per-ticker bronze snapshots under `data-lake/bronze/asset_class={equity|volatility|futures}/symbol=<ticker>/data.parquet`, and DuckDB is rebuilt from parquet when you want a local analytical file. Futures use composite ticker names (`ES_202506`) and a dedicated schema with `contract_id`, `root_symbol`, `expiry_date`, `settlement`, and `open_interest`. Delisted symbols that should no longer participate in future syncs can be archived out of the canonical sync path under `data-lake/bronze-delisted/asset_class=equity/symbol=<ticker>/data.parquet` while preserving their history. The broader staged-Parquet and multi-asset orchestration remains the target architecture, but the live service path no longer writes `market.duckdb`. For scheduled daily syncs, IB remains the primary source; the daily daemon automatically syncs all asset classes (equity, volatility, futures), and has a narrow external fallback chain for unresolved target-day gaps in the U.S. equity universe.
 
 The goal is to give you:
 
@@ -214,13 +214,19 @@ python scripts/fetch_ib_historical.py --preset presets/sp500.json --backfill
 
 # Fetch CBOE volatility indices (VIX, VVIX, etc.):
 python scripts/fetch_ib_historical.py --preset presets/volatility.json --asset-class volatility
+
+# Fetch CME/CBOT index futures:
+python scripts/fetch_ib_historical.py --preset presets/futures-index.json --asset-class futures
+
+# Fetch NYMEX energy futures:
+python scripts/fetch_ib_historical.py --preset presets/futures-energy.json --asset-class futures
 ```
 
 Current behavior:
 - Normal mode atomically rewrites the canonical per-ticker bronze snapshot
 - The writer uses `temp -> validate -> os.replace()` for crash-safe publication
 - If IB returns an empty head timestamp for a symbol, the fetcher falls back to the earliest supported IB historical date instead of skipping the symbol entirely
-- `--asset-class` flag supports `equity` (default, `Stock('SYMBOL', 'SMART')`) and `volatility` (`Index('SYMBOL', 'CBOE')` for CBOE indices like VIX)
+- `--asset-class` flag supports `equity` (default, `Stock('SYMBOL', 'SMART')`), `volatility` (`Index('SYMBOL', 'CBOE')`), and `futures` (`Future(root, expiry, exchange)` with composite tickers like `ES_202506`)
 
 ### Backfill Mode
 
@@ -283,6 +289,9 @@ python scripts/daily_update.py --port 7497 --max-concurrent 4 --batch-size 25
 
 # Daily update for volatility indices (skips fallback chain):
 python scripts/daily_update.py --asset-class volatility
+
+# Daily update for futures contracts:
+python scripts/daily_update.py --asset-class futures
 ```
 
 **Key design:**
@@ -311,9 +320,10 @@ When you want a fresh queryable DuckDB file without making the service hold a wr
 source ~/market-warehouse/.venv/bin/activate
 python scripts/rebuild_duckdb_from_parquet.py                            # Rebuild equity data (default)
 python scripts/rebuild_duckdb_from_parquet.py --asset-class volatility   # Rebuild volatility data
+python scripts/rebuild_duckdb_from_parquet.py --asset-class futures      # Rebuild futures data
 ```
 
-This rebuilds `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree using set-based `INSERT INTO ... SELECT FROM read_parquet(...)`. The rebuild path recreates the analytical tables from scratch on each run, so it is safe to rerun against an existing DuckDB file. The `--asset-class` flag derives the correct bronze directory and sets the appropriate `venue` in `md.symbols` (`SMART` for equity, `CBOE` for volatility).
+This rebuilds `~/market-warehouse/duckdb/market.duckdb` from the canonical bronze parquet tree using set-based `INSERT INTO ... SELECT FROM read_parquet(...)`. The rebuild path recreates the analytical tables from scratch on each run, so it is safe to rerun against an existing DuckDB file. The `--asset-class` flag derives the correct bronze directory and sets the appropriate `venue` in `md.symbols` (`SMART` for equity, `CBOE` for volatility). Futures use `replace_futures_from_parquet()` which populates `md.futures_daily` directly (no `md.symbols` entries).
 
 ## Strategies (Extracted to doob)
 
@@ -348,7 +358,7 @@ launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update.plist
 launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update-watchdog.plist
 ```
 
-`scripts/run_daily_update.sh` now loads `.env` files, activates the warehouse venv, and runs `scripts/run_daily_update_job.py`, which retries failed sync attempts before marking the day as failed. The runner automatically syncs all asset classes (equity, then volatility) in a single invocation; pass `--asset-class <name>` to run only one.
+`scripts/run_daily_update.sh` now loads `.env` files, activates the warehouse venv, and runs `scripts/run_daily_update_job.py`, which retries failed sync attempts before marking the day as failed. The runner automatically syncs all asset classes (equity, volatility, then futures) in a single invocation; pass `--asset-class <name>` to run only one.
 
 The main sync runs at **13:05 Pacific local time daily** (**4:05 PM Eastern year-round**). The watchdog runs at **18:30 Pacific** by default and sends an alert if the main job never started or never logged a successful completion marker. Non-trading days are harmless no-ops because `daily_update.py` checks `is_trading_day()` internally and exits early.
 
@@ -516,6 +526,8 @@ The intended workflow is:
 │   │   │   └── symbol=AAPL/data.parquet
 │   │   ├── asset_class=volatility/
 │   │   │   └── symbol=VIX/data.parquet
+│   │   ├── asset_class=futures/
+│   │   │   └── symbol=ES_202506/data.parquet
 │   │   ├── asset_class=option/
 │   │   └── asset_class=future/
 │   ├── silver/
