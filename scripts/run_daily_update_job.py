@@ -17,6 +17,8 @@ from typing import Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+ASSET_CLASSES = ["equity", "volatility"]
+
 
 @dataclass(frozen=True)
 class RunnerConfig:
@@ -309,7 +311,22 @@ def run_with_retries(
 
 def main(argv: Sequence[str] | None = None) -> int:
     config = build_config()
-    return run_with_retries(config, list(argv or sys.argv[1:]), env=os.environ.copy())
+    args = list(argv or sys.argv[1:])
+    env = os.environ.copy()
+
+    # If --asset-class is explicitly specified, run just that one.
+    if "--asset-class" in args:
+        return run_with_retries(config, args, env=env)
+
+    # Otherwise, run all asset classes sequentially.
+    final_code = 0
+    for asset_class in ASSET_CLASSES:
+        code = run_with_retries(
+            config, args + ["--asset-class", asset_class], env=env
+        )
+        if code != 0:
+            final_code = code
+    return final_code
 
 
 if __name__ == "__main__":

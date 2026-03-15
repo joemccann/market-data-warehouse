@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from scripts.run_daily_update_job import (
+    ASSET_CLASSES,
     _utc_now,
     AlertRequest,
     RunnerConfig,
@@ -491,11 +492,41 @@ class TestRunWithRetries:
 
 
 class TestMain:
-    def test_main_uses_build_config(self):
+    def test_main_runs_all_asset_classes_by_default(self):
+        config = _config(Path("/tmp/test"))
+        calls: list[list[str]] = []
+
+        def _run(cfg, args, env):
+            calls.append(args)
+            return 0
+
+        with patch("scripts.run_daily_update_job.build_config", return_value=config):
+            with patch("scripts.run_daily_update_job.run_with_retries", side_effect=_run):
+                assert main(["--dry-run"]) == 0
+
+        assert calls == [
+            ["--dry-run", "--asset-class", ac] for ac in ASSET_CLASSES
+        ]
+
+    def test_main_explicit_asset_class_runs_single(self):
         config = _config(Path("/tmp/test"))
 
         with patch("scripts.run_daily_update_job.build_config", return_value=config):
             with patch("scripts.run_daily_update_job.run_with_retries", return_value=0) as run_mock:
-                assert main(["--dry-run"]) == 0
+                assert main(["--dry-run", "--asset-class", "volatility"]) == 0
 
-        run_mock.assert_called_once_with(config, ["--dry-run"], env=os.environ.copy())
+        run_mock.assert_called_once_with(
+            config, ["--dry-run", "--asset-class", "volatility"], env=os.environ.copy()
+        )
+
+    def test_main_returns_nonzero_if_any_asset_class_fails(self):
+        config = _config(Path("/tmp/test"))
+
+        def _run(cfg, args, env):
+            if "--asset-class" in args and args[args.index("--asset-class") + 1] == "volatility":
+                return 1
+            return 0
+
+        with patch("scripts.run_daily_update_job.build_config", return_value=config):
+            with patch("scripts.run_daily_update_job.run_with_retries", side_effect=_run):
+                assert main([]) == 1
