@@ -202,7 +202,7 @@ sed "s|/path/to/repo|$(pwd)|g" scripts/com.market-warehouse.daily-update-watchdo
 launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update.plist
 launchctl load ~/Library/LaunchAgents/com.market-warehouse.daily-update-watchdog.plist
 ```
-`scripts/run_daily_update.sh` now loads `.env` files, activates the warehouse venv, and runs `scripts/run_daily_update_job.py`, which retries failed sync attempts before terminal failure.
+`scripts/run_daily_update.sh` now loads `.env` files, activates the warehouse venv, and runs `scripts/run_daily_update_job.py`, which retries failed sync attempts before terminal failure. The runner automatically syncs all asset classes (equity, then volatility) in a single invocation; pass `--asset-class <name>` to run only one.
 
 The main sync runs at 13:05 Pacific local time daily (4:05 PM Eastern year-round). The watchdog runs at 18:30 Pacific by default and alerts if the scheduled sync never started or never logged a completion marker. Non-trading days are harmless no-ops.
 
