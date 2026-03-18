@@ -1,7 +1,9 @@
 {
   "name": "volatility",
   "description": "CBOE Volatility Indices",
-  "tickers": ["VIX","VVIX","COR1M","COR3M","OVX","VXSLV","VXEEM","VXGDX","VXSMH","VXHYG","VIX3M","VXN","RVX"],
+  "tickers": ["VIX","VVIX","COR1M","COR3M","OVX","VXSLV","VXEEM","VXGDX","VIX3M","VXN","RVX"],
+  "cboe_only": ["VXHYG","VXSMH"],
   "sector": "Volatility",
-  "source": "CBOE Global Indices"
+  "source": "CBOE Global Indices",
+  "notes": "VXHYG and VXSMH are not available via IB; use scripts/fetch_cboe_volatility.py"
 }
