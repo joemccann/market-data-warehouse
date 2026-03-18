@@ -19,6 +19,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 ASSET_CLASSES = ["equity", "volatility", "futures"]
 
+# CBOE-only volatility indices not available via IB
+CBOE_ONLY_SYMBOLS = ["VXHYG", "VXSMH"]
+
 
 @dataclass(frozen=True)
 class RunnerConfig:
@@ -104,6 +107,13 @@ def build_daily_update_command(
     config: RunnerConfig, daily_update_args: Sequence[str]
 ) -> list[str]:
     return [config.python_bin, str(config.daily_update_script), *daily_update_args]
+
+
+def build_cboe_volatility_command(
+    config: RunnerConfig, symbols: Sequence[str]
+) -> list[str]:
+    cboe_script = SCRIPT_DIR / "fetch_cboe_volatility.py"
+    return [config.python_bin, str(cboe_script), "--symbols", *symbols]
 
 
 def build_alert_command(config: RunnerConfig, request: AlertRequest) -> list[str]:
@@ -309,6 +319,40 @@ def run_with_retries(
     return final_exit_code
 
 
+def run_cboe_volatility_sync(
+    config: RunnerConfig,
+    symbols: Sequence[str],
+    env: dict[str, str] | None = None,
+    runner: callable = subprocess.run,
+    now_fn: callable = _utc_now,
+) -> int:
+    """Sync CBOE-only volatility indices directly from CBOE API."""
+    started_at = now_fn()
+    log_file = build_log_file(config.log_dir, started_at)
+    command = build_cboe_volatility_command(config, symbols)
+
+    append_log(
+        log_file,
+        f"=== CBOE Volatility Sync {started_at:%Y-%m-%dT%H:%M:%SZ} ===",
+    )
+    append_log(log_file, f"Command: {' '.join(command)}")
+
+    result = run_daily_update_attempt(command, log_file, env=env, runner=runner)
+
+    if result.returncode == 0:
+        append_log(
+            log_file,
+            f"=== CBOE Volatility Sync Done {now_fn():%Y-%m-%dT%H:%M:%SZ} ===",
+        )
+    else:
+        append_log(
+            log_file,
+            f"=== CBOE Volatility Sync Failed {now_fn():%Y-%m-%dT%H:%M:%SZ} (exit_code={result.returncode}) ===",
+        )
+
+    return result.returncode
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     config = build_config()
     args = list(argv or sys.argv[1:])
@@ -326,6 +370,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if code != 0:
             final_code = code
+
+    # Also sync CBOE-only volatility indices (VXHYG, VXSMH)
+    if CBOE_ONLY_SYMBOLS:
+        cboe_code = run_cboe_volatility_sync(config, CBOE_ONLY_SYMBOLS, env=env)
+        if cboe_code != 0:
+            final_code = cboe_code
+
     return final_code
 
 

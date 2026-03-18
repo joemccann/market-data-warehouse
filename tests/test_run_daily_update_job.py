@@ -12,11 +12,13 @@ import pytest
 
 from scripts.run_daily_update_job import (
     ASSET_CLASSES,
+    CBOE_ONLY_SYMBOLS,
     _utc_now,
     AlertRequest,
     RunnerConfig,
     append_log,
     build_alert_command,
+    build_cboe_volatility_command,
     build_config,
     build_daily_update_command,
     build_log_file,
@@ -24,6 +26,7 @@ from scripts.run_daily_update_job import (
     log_has_completion_marker,
     main,
     node_binary_exists,
+    run_cboe_volatility_sync,
     run_daily_update_attempt,
     run_with_retries,
     send_failure_alert,
@@ -491,33 +494,102 @@ class TestRunWithRetries:
         )
 
 
-class TestMain:
-    def test_main_runs_all_asset_classes_by_default(self):
-        config = _config(Path("/tmp/test"))
-        calls: list[list[str]] = []
+class TestCboeVolatilitySync:
+    def test_build_cboe_volatility_command(self, tmp_path):
+        config = _config(tmp_path)
+        command = build_cboe_volatility_command(config, ["VXHYG", "VXSMH"])
+        assert command[0] == "/usr/bin/python3"
+        assert "fetch_cboe_volatility.py" in command[1]
+        assert command[2:] == ["--symbols", "VXHYG", "VXSMH"]
 
-        def _run(cfg, args, env):
-            calls.append(args)
+    def test_run_cboe_volatility_sync_success(self, tmp_path):
+        config = _config(tmp_path)
+        timestamps = iter(
+            [
+                datetime(2026, 3, 18, 20, 5, 7, tzinfo=timezone.utc),
+                datetime(2026, 3, 18, 20, 5, 8, tzinfo=timezone.utc),
+            ]
+        )
+
+        def _runner(command, stdout, stderr, text, env, check):
+            stdout.write("CBOE fetch ok\n")
+            return SimpleNamespace(returncode=0)
+
+        rc = run_cboe_volatility_sync(
+            config,
+            ["VXHYG", "VXSMH"],
+            env={},
+            runner=_runner,
+            now_fn=lambda: next(timestamps),
+        )
+
+        assert rc == 0
+        log_text = (config.log_dir / "daily_update_2026-03-18.log").read_text(encoding="utf-8")
+        assert "CBOE Volatility Sync" in log_text
+        assert "CBOE Volatility Sync Done" in log_text
+
+    def test_run_cboe_volatility_sync_failure(self, tmp_path):
+        config = _config(tmp_path)
+        timestamps = iter(
+            [
+                datetime(2026, 3, 18, 20, 5, 7, tzinfo=timezone.utc),
+                datetime(2026, 3, 18, 20, 5, 8, tzinfo=timezone.utc),
+            ]
+        )
+
+        def _runner(command, stdout, stderr, text, env, check):
+            stdout.write("CBOE fetch failed\n")
+            return SimpleNamespace(returncode=1)
+
+        rc = run_cboe_volatility_sync(
+            config,
+            ["VXHYG"],
+            env={},
+            runner=_runner,
+            now_fn=lambda: next(timestamps),
+        )
+
+        assert rc == 1
+        log_text = (config.log_dir / "daily_update_2026-03-18.log").read_text(encoding="utf-8")
+        assert "CBOE Volatility Sync Failed" in log_text
+
+
+class TestMain:
+    def test_main_runs_all_asset_classes_and_cboe_by_default(self):
+        config = _config(Path("/tmp/test"))
+        ib_calls: list[list[str]] = []
+        cboe_calls: list[list[str]] = []
+
+        def _run_ib(cfg, args, env):
+            ib_calls.append(args)
+            return 0
+
+        def _run_cboe(cfg, symbols, env, **kwargs):
+            cboe_calls.append(list(symbols))
             return 0
 
         with patch("scripts.run_daily_update_job.build_config", return_value=config):
-            with patch("scripts.run_daily_update_job.run_with_retries", side_effect=_run):
-                assert main(["--dry-run"]) == 0
+            with patch("scripts.run_daily_update_job.run_with_retries", side_effect=_run_ib):
+                with patch("scripts.run_daily_update_job.run_cboe_volatility_sync", side_effect=_run_cboe):
+                    assert main(["--dry-run"]) == 0
 
-        assert calls == [
+        assert ib_calls == [
             ["--dry-run", "--asset-class", ac] for ac in ASSET_CLASSES
         ]
+        assert cboe_calls == [CBOE_ONLY_SYMBOLS]
 
-    def test_main_explicit_asset_class_runs_single(self):
+    def test_main_explicit_asset_class_skips_cboe(self):
         config = _config(Path("/tmp/test"))
 
         with patch("scripts.run_daily_update_job.build_config", return_value=config):
             with patch("scripts.run_daily_update_job.run_with_retries", return_value=0) as run_mock:
-                assert main(["--dry-run", "--asset-class", "volatility"]) == 0
+                with patch("scripts.run_daily_update_job.run_cboe_volatility_sync") as cboe_mock:
+                    assert main(["--dry-run", "--asset-class", "volatility"]) == 0
 
         run_mock.assert_called_once_with(
             config, ["--dry-run", "--asset-class", "volatility"], env=os.environ.copy()
         )
+        cboe_mock.assert_not_called()
 
     def test_main_returns_nonzero_if_any_asset_class_fails(self):
         config = _config(Path("/tmp/test"))
@@ -529,4 +601,13 @@ class TestMain:
 
         with patch("scripts.run_daily_update_job.build_config", return_value=config):
             with patch("scripts.run_daily_update_job.run_with_retries", side_effect=_run):
-                assert main([]) == 1
+                with patch("scripts.run_daily_update_job.run_cboe_volatility_sync", return_value=0):
+                    assert main([]) == 1
+
+    def test_main_returns_nonzero_if_cboe_fails(self):
+        config = _config(Path("/tmp/test"))
+
+        with patch("scripts.run_daily_update_job.build_config", return_value=config):
+            with patch("scripts.run_daily_update_job.run_with_retries", return_value=0):
+                with patch("scripts.run_daily_update_job.run_cboe_volatility_sync", return_value=1):
+                    assert main([]) == 1
