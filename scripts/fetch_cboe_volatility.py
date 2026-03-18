@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fetch CBOE volatility index historical data directly from CBOE's API.
 
-Used for indices not available via Interactive Brokers (e.g., VXHYG, VXSMH).
+Primary daily sync source for all CBOE volatility indices. Also used for
+historical backfill of indices not available via IB (e.g., VXHYG, VXSMH).
 Writes to bronze parquet in the standard warehouse format.
 """
 
@@ -24,6 +25,8 @@ console = Console()
 CBOE_HISTORICAL_URL = "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_{symbol}.json"
 
 DEFAULT_WAREHOUSE = Path.home() / "market-warehouse"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_PRESET = SCRIPT_DIR.parent / "presets" / "volatility.json"
 ASSET_CLASS = "volatility"
 
 
@@ -48,7 +51,11 @@ def fetch_cboe_historical(symbol: str) -> list[dict[str, Any]]:
 
 
 def bars_to_table(symbol: str, bars: list[dict[str, Any]]) -> pa.Table:
-    """Convert CBOE JSON bars to PyArrow table matching bronze schema."""
+    """Convert CBOE JSON bars to PyArrow table matching bronze schema.
+    
+    Note: asset_class and symbol are NOT included in the parquet file;
+    they're encoded in the hive partition path (asset_class=X/symbol=Y/).
+    """
     if not bars:
         return None
     
@@ -65,8 +72,6 @@ def bars_to_table(symbol: str, bars: list[dict[str, Any]]) -> pa.Table:
             "close": float(bar["close"]),
             "adj_close": float(bar["close"]),  # No adjustment for indices
             "volume": int(float(bar["volume"])),
-            "asset_class": ASSET_CLASS,
-            "symbol": symbol,
         })
     
     schema = pa.schema([
@@ -78,8 +83,6 @@ def bars_to_table(symbol: str, bars: list[dict[str, Any]]) -> pa.Table:
         ("close", pa.float64()),
         ("adj_close", pa.float64()),
         ("volume", pa.int64()),
-        ("asset_class", pa.string()),
-        ("symbol", pa.string()),
     ])
     
     return pa.Table.from_pylist(records, schema=schema)
@@ -127,13 +130,25 @@ def write_bronze_parquet(
     return parquet_path
 
 
+def load_preset(preset_path: Path) -> list[str]:
+    """Load ticker symbols from a preset JSON file."""
+    with preset_path.open() as f:
+        data = json.load(f)
+    return data.get("tickers", [])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--symbols",
         nargs="+",
-        default=["VXHYG", "VXSMH"],
-        help="CBOE volatility index symbols to fetch (default: VXHYG VXSMH)",
+        help="CBOE volatility index symbols to fetch",
+    )
+    group.add_argument(
+        "--preset",
+        type=Path,
+        help=f"Path to preset JSON file (default: {DEFAULT_PRESET})",
     )
     parser.add_argument(
         "--warehouse",
@@ -143,9 +158,19 @@ def main() -> None:
     )
     args = parser.parse_args()
     
-    console.print(f"\n[bold]Fetching CBOE volatility indices: {args.symbols}[/bold]\n")
+    # Determine symbols to fetch
+    if args.symbols:
+        symbols = args.symbols
+    elif args.preset:
+        symbols = load_preset(args.preset)
+    elif DEFAULT_PRESET.exists():
+        symbols = load_preset(DEFAULT_PRESET)
+    else:
+        symbols = ["VIX", "VVIX"]  # Minimal fallback
     
-    for symbol in args.symbols:
+    console.print(f"\n[bold]Fetching CBOE volatility indices: {symbols}[/bold]\n")
+    
+    for symbol in symbols:
         try:
             bars = fetch_cboe_historical(symbol)
             if not bars:

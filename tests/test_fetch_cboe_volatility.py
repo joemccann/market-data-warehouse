@@ -14,8 +14,25 @@ from scripts.fetch_cboe_volatility import (
     _symbol_id,
     bars_to_table,
     fetch_cboe_historical,
+    load_preset,
     write_bronze_parquet,
 )
+
+
+class TestLoadPreset:
+    def test_loads_tickers_from_preset(self, tmp_path):
+        preset = tmp_path / "test.json"
+        preset.write_text('{"tickers": ["VIX", "VVIX", "VXHYG"]}')
+        
+        symbols = load_preset(preset)
+        assert symbols == ["VIX", "VVIX", "VXHYG"]
+
+    def test_returns_empty_list_if_no_tickers(self, tmp_path):
+        preset = tmp_path / "test.json"
+        preset.write_text('{"name": "test"}')
+        
+        symbols = load_preset(preset)
+        assert symbols == []
 
 
 class TestSymbolId:
@@ -69,12 +86,12 @@ class TestBarsToTable:
         table = bars_to_table("VXHYG", bars)
 
         assert table.num_rows == 2
+        # asset_class and symbol are in hive partition path, not in parquet
         assert set(table.column_names) == {
             "trade_date", "symbol_id", "open", "high", "low",
-            "close", "adj_close", "volume", "asset_class", "symbol"
+            "close", "adj_close", "volume"
         }
-        assert table.column("symbol")[0].as_py() == "VXHYG"
-        assert table.column("asset_class")[0].as_py() == "volatility"
+        assert table.column("close")[0].as_py() == 10.5
 
     def test_empty_bars_returns_none(self):
         """Empty bars list returns None."""

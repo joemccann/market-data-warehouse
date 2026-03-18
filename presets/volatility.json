@@ -1,9 +1,8 @@
 {
   "name": "volatility",
   "description": "CBOE Volatility Indices",
-  "tickers": ["VIX","VVIX","COR1M","COR3M","OVX","VXSLV","VXEEM","VXGDX","VIX3M","VXN","RVX"],
-  "cboe_only": ["VXHYG","VXSMH"],
+  "tickers": ["VIX","VVIX","COR1M","COR3M","OVX","VXSLV","VXEEM","VXGDX","VIX3M","VXN","RVX","VXHYG","VXSMH"],
   "sector": "Volatility",
   "source": "CBOE Global Indices",
-  "notes": "VXHYG and VXSMH are not available via IB; use scripts/fetch_cboe_volatility.py"
+  "notes": "Daily sync uses CBOE API directly. IB can be used for historical backfill but lacks VXHYG/VXSMH."
 }

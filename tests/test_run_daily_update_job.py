@@ -12,7 +12,6 @@ import pytest
 
 from scripts.run_daily_update_job import (
     ASSET_CLASSES,
-    CBOE_ONLY_SYMBOLS,
     _utc_now,
     AlertRequest,
     RunnerConfig,
@@ -497,10 +496,10 @@ class TestRunWithRetries:
 class TestCboeVolatilitySync:
     def test_build_cboe_volatility_command(self, tmp_path):
         config = _config(tmp_path)
-        command = build_cboe_volatility_command(config, ["VXHYG", "VXSMH"])
+        command = build_cboe_volatility_command(config)
         assert command[0] == "/usr/bin/python3"
         assert "fetch_cboe_volatility.py" in command[1]
-        assert command[2:] == ["--symbols", "VXHYG", "VXSMH"]
+        assert len(command) == 2  # No extra args, uses preset by default
 
     def test_run_cboe_volatility_sync_success(self, tmp_path):
         config = _config(tmp_path)
@@ -517,7 +516,6 @@ class TestCboeVolatilitySync:
 
         rc = run_cboe_volatility_sync(
             config,
-            ["VXHYG", "VXSMH"],
             env={},
             runner=_runner,
             now_fn=lambda: next(timestamps),
@@ -543,7 +541,6 @@ class TestCboeVolatilitySync:
 
         rc = run_cboe_volatility_sync(
             config,
-            ["VXHYG"],
             env={},
             runner=_runner,
             now_fn=lambda: next(timestamps),
@@ -558,14 +555,14 @@ class TestMain:
     def test_main_runs_all_asset_classes_and_cboe_by_default(self):
         config = _config(Path("/tmp/test"))
         ib_calls: list[list[str]] = []
-        cboe_calls: list[list[str]] = []
+        cboe_called = []
 
         def _run_ib(cfg, args, env):
             ib_calls.append(args)
             return 0
 
-        def _run_cboe(cfg, symbols, env, **kwargs):
-            cboe_calls.append(list(symbols))
+        def _run_cboe(cfg, env, **kwargs):
+            cboe_called.append(True)
             return 0
 
         with patch("scripts.run_daily_update_job.build_config", return_value=config):
@@ -573,10 +570,11 @@ class TestMain:
                 with patch("scripts.run_daily_update_job.run_cboe_volatility_sync", side_effect=_run_cboe):
                     assert main(["--dry-run"]) == 0
 
+        # IB syncs equity and futures; volatility via CBOE
         assert ib_calls == [
             ["--dry-run", "--asset-class", ac] for ac in ASSET_CLASSES
         ]
-        assert cboe_calls == [CBOE_ONLY_SYMBOLS]
+        assert cboe_called == [True]
 
     def test_main_explicit_asset_class_skips_cboe(self):
         config = _config(Path("/tmp/test"))
@@ -584,10 +582,10 @@ class TestMain:
         with patch("scripts.run_daily_update_job.build_config", return_value=config):
             with patch("scripts.run_daily_update_job.run_with_retries", return_value=0) as run_mock:
                 with patch("scripts.run_daily_update_job.run_cboe_volatility_sync") as cboe_mock:
-                    assert main(["--dry-run", "--asset-class", "volatility"]) == 0
+                    assert main(["--dry-run", "--asset-class", "equity"]) == 0
 
         run_mock.assert_called_once_with(
-            config, ["--dry-run", "--asset-class", "volatility"], env=os.environ.copy()
+            config, ["--dry-run", "--asset-class", "equity"], env=os.environ.copy()
         )
         cboe_mock.assert_not_called()
 
@@ -595,7 +593,7 @@ class TestMain:
         config = _config(Path("/tmp/test"))
 
         def _run(cfg, args, env):
-            if "--asset-class" in args and args[args.index("--asset-class") + 1] == "volatility":
+            if "--asset-class" in args and args[args.index("--asset-class") + 1] == "futures":
                 return 1
             return 0
 
