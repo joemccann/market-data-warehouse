@@ -50,6 +50,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--password-service", default=DEFAULT_PASSWORD_SERVICE)
     parser.add_argument("--tws-major-version")
     parser.add_argument(
+        "--manual-only",
+        action="store_true",
+        help="Disable RunAtLoad and any launchd schedule; start only via the helper scripts.",
+    )
+    parser.add_argument(
         "--no-bootstrap",
         action="store_true",
         help="Write files but do not bootstrap the LaunchAgent into launchd.",
@@ -132,6 +137,9 @@ def detect_tws_major_version(args: argparse.Namespace) -> str:
 
 def resolve_schedule(args: argparse.Namespace) -> tuple[list[dict[str, int]], bool]:
     """Use the current or legacy LaunchAgent schedule if present."""
+    if args.manual_only:
+        return [], False
+
     for label in agent_labels_for_lookup(args):
         agent_plist = args.launch_agents_dir / f"{label}.plist"
         data = read_plist(agent_plist)
@@ -412,8 +420,9 @@ def render_launch_agent_plist(
         "EnvironmentVariables": {
             "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         },
-        "StartCalendarInterval": schedule,
     }
+    if schedule:
+        data["StartCalendarInterval"] = schedule
     return plistlib.dumps(data)
 
 

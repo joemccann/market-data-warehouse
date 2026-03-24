@@ -23,4 +23,4 @@ load_env_file() {
 load_env_file "$REPO_ENV"
 load_env_file "$WAREHOUSE_ENV"
 source "$VENV/bin/activate"
-python "$SCRIPT_DIR/run_daily_update_job.py" "$@"
+"$VENV/bin/python" "$SCRIPT_DIR/run_daily_update_job.py" "$@"

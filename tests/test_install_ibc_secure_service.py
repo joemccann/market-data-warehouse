@@ -180,7 +180,8 @@ class TestResolveSchedule:
             )
         )
         args = argparse.Namespace(
-            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"]
+            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"],
+            manual_only=False,
         )
         schedule, run_at_load = resolve_schedule(args)
 
@@ -198,7 +199,8 @@ class TestResolveSchedule:
             )
         )
         args = argparse.Namespace(
-            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"]
+            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"],
+            manual_only=False,
         )
         schedule, run_at_load = resolve_schedule(args)
         assert schedule == [{"Hour": 8, "Minute": 5, "Weekday": 4}]
@@ -206,11 +208,21 @@ class TestResolveSchedule:
 
     def test_falls_back_to_defaults(self, tmp_path):
         args = argparse.Namespace(
-            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"]
+            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"],
+            manual_only=False,
         )
         schedule, run_at_load = resolve_schedule(args)
         assert schedule == DEFAULT_SCHEDULE
         assert run_at_load is True
+
+    def test_manual_only_returns_empty(self, tmp_path):
+        args = argparse.Namespace(
+            service_label="current", launch_agents_dir=tmp_path, legacy_labels=["legacy"],
+            manual_only=True,
+        )
+        schedule, run_at_load = resolve_schedule(args)
+        assert schedule == []
+        assert run_at_load is False
 
 
 class TestAgentLabelsForLookup:
@@ -493,6 +505,7 @@ class TestInstall:
             password_service="svc.pass",
             tws_major_version=None,
             no_bootstrap=False,
+            manual_only=False,
         )
 
         with patch(
@@ -548,6 +561,7 @@ class TestInstall:
             password_service="svc.pass",
             tws_major_version="10.44",
             no_bootstrap=True,
+            manual_only=False,
         )
 
         with patch(
